@@ -309,6 +309,54 @@ bool ttsPlaying = false;
 bool micPausedByServer = false;
 volatile unsigned long micWindowEndMs = 0;   // >0: đang mở "cửa sổ nghe lệnh" (nhạc đang phát)
 
+// ---- BARGE-IN KHI ROBOT ĐANG NÓI (khử echo bằng tương quan mức loa/mic) ----
+// Ý tưởng: không có AEC phần cứng -> ước lượng tiếng loa vọng vào mic:
+//   echo(mic) ≈ k * mức_loa_đang_phát, hệ số k tự học trong lúc robot nói.
+// Anh nói đè lên (mức mic vượt nền echo) NGAY trong lúc robot trả lời ->
+// gửi barge-in cho server: server tắt câu đang nói + nghe câu hỏi mới của anh.
+volatile bool bargeArmed = false;         // true: robot đang nói TTS -> mic chạy chế độ gate
+volatile float speakerRmsEma = 0.0f;      // mức RMS loa đang phát (speakerTask cập nhật)
+float echoMicRmsEma = 0.0f;               // mức RMS mic trong lúc loa phát (echo)
+float kCoupling = 0.35f;                  // hệ số truyền echo loa->mic, tự học
+int bargeStreak = 0;                      // số khung liên tiếp vượt nền echo
+unsigned long bargeCooldownUntil = 0;     // chống dội barge-in liên tiếp
+unsigned long lastPingAtMs = 0;           // heartbeat server (chống treo mic vĩnh viễn)
+
+// Ngưỡng barge-in (tinh chỉnh nhanh nếu robot nhạy/quá trơ):
+const float BARGE_EXCESS     = 0.030f;  // SÀN cố định mức vượt nền echo (cũ)
+const float BARGE_FLOOR      = 0.030f;  // sàn tuyệt đối mới: mic floor 0.03 + 0.30*echo ước lượng
+const float BARGE_REL_ECHO   = 0.30f;   // người nói đè phải vượt 30% mức echo ước lượng
+const int   BARGE_FRAMES     = 8;       // 8 khung x 16ms ≈ 128ms (máy nói TTS là tiếng VIỆT -> Silero VAD server xác nhận lại)
+const unsigned long BARGE_COOLDOWN_MS = 1500;
+float bargeFloorMed = 0.0f;             // median(3) mức vượt nền - chặn kích tức thời do nhiễu đơn lẻ
+
+// ---- ENERGY GATE: chỉ stream mic khi có tiếng thật (chống spam 62 frame/s
+// lên WiFi + server khi phòng im lặng). Nền nhiễu tự học EMA khi mic đóng. ----
+const float   GATE_ABS_FLOOR  = 0.012f;  // sàn tuyệt đối RMS (0.014 ~ -37dBFS sau gain >>14)
+const float   GATE_MULT       = 3.0f;    // vượt 3x nền nhiễu => mở gate
+const int     GATE_OPEN_FRAMES = 2;      // 2 khung 16ms liên tiếp để chống tiếng "cộc"
+const unsigned long GATE_HANGOVER_MS = 1200;  // giữ mở thêm 1.2s sau khi RMS rơi
+float gateNoiseEma = 0.004f;             // nền nhiễu môi trường tự học
+bool  gateOpen = false;
+int   gateOpenStreak = 0;
+unsigned long gateLastActiveMs = 0;
+bool  gateOpenedWithPreroll = false;     // avoid double-send of preroll ring
+
+// Ring pre-roll 16 khung 16ms = 256ms: lời nói thường bắt đầu nhẹ (phụ âm) -
+// gửi kèm cả quá khứ khi gate vừa mở để server không nuốt âm đầu câu.
+#define PREROLLS 16
+int16_t preRollRing[PREROLLS][MIC_CHUNK_SAMPLES];
+int preRollIdx = 0;
+bool preRollFull = false;
+
+void resetEchoGate() {
+    echoMicRmsEma = 0.0f;
+    kCoupling = 0.35f;
+    bargeStreak = 0;
+    bargeFloorMed = 0.0f;
+    speakerRmsEma = 0.0f;
+}
+
 // =========================================================================
 // 7. NETWORK STATE
 // =========================================================================
@@ -1308,6 +1356,7 @@ void flushSpeakerRing() {
     }
     ttsPlaying = false;
     micPausedByServer = false;
+    bargeArmed = false;     // loa bị xả (barge-in/stop) -> không gate echo nữa
 }
 
 void sendProtocolHello() {
@@ -1318,7 +1367,7 @@ void sendProtocolHello() {
         deviceId = "xiaoxi-" + mac.substring(mac.length() > 6 ? mac.length() - 6 : 0);
     }
     protocolV2 = false;
-    String caps = "\"audio_pcm16_16k\",\"touch\",\"tft_st7789\",\"oled_ssd1306\",\"music\",\"servo\",\"dual_i2s\"";
+    String caps = "\"audio_pcm16_16k\",\"touch\",\"tft_st7789\",\"oled_ssd1306\",\"music\",\"servo\",\"dual_i2s\",\"barge_voice_echo_gate\",\"mic_energy_gate\"";
 #if defined(XIAOXI_TARGET_S3)
     caps += ",\"esp32s3\",\"usb_cdc\"";
     if (ESP.getPsramSize() > 0) caps += ",\"psram\"";
@@ -1422,6 +1471,7 @@ void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
             wsConnected = true;
             ttsPlaying = false;
             micPausedByServer = false;
+            bargeArmed = false;
             musicPlaying = false;
             protocolV2 = false;
             ignoreAudioUntil = 0;
@@ -1450,12 +1500,20 @@ void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
                 return;
             }
             if (msg == "__PING__") {
+                lastPingAtMs = millis();
                 webSocket.sendTXT("__PONG__");
                 return;
             }
             if (msg == "__SPEAK_START__") {
                 ttsPlaying = true;
-                micPausedByServer = true;   // không tự nghe tiếng mình
+                if (musicPlaying) {
+                    micPausedByServer = true;   // NHẠC: bít mic, nghe lệnh theo __MIC_WINDOW__
+                } else {
+                    // TTS: MIC SỐNG với chế độ khử echo -> anh nói đè được khi robot đang trả lời
+                    micPausedByServer = false;
+                    bargeArmed = true;
+                    resetEchoGate();
+                }
                 ignoreAudioUntil = 0;
                 return;
             }
@@ -1467,6 +1525,10 @@ void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
             if (msg == "__SPEAK_END__") {
                 // Không xóa ring buffer ngay kẻo vứt mất phần đuôi câu nói đang phát dở!
                 // speakerTask sẽ tự động phát hết sạch dữ liệu (avail == 0) rồi mới mở lại mic.
+                if (!musicPlaying) {
+                    bargeArmed = false;         // hết câu trả lời -> về nghe bình thường
+                    micPausedByServer = false;
+                }
                 return;
             }
             if (msg == "__MIC_WINDOW__") {
@@ -1484,6 +1546,7 @@ void onWebSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
                 wsConnected = false;
                 protocolV2 = false;
                 musicPlaying = false;
+                bargeArmed = false;
                 flushSpeakerRing();
                 micWindowEndMs = 0;
                 return;
@@ -1649,10 +1712,14 @@ void micTask(void *param) {
         if (!wsConnected) {
             // DMA I2S vẫn nạp đầy khi mất mạng -> khi WS sống lại, khối cũ
             // (tiếng của quá khứ) tràn xuống server làm Whisper đọc sai câu.
-            // Xả DMA liên tục như khi robot đang nói, nghỉ 16ms/khung.
+            // Xả sạch TOÀN BỘ DMA (8 buffer x 256 mẫu) cho tới khi read
+            // timeout, không chỉ xả 1 khung/lượt lặp.
             int32_t flush[MIC_CHUNK_SAMPLES];
             size_t br = 0;
-            i2s_read(I2S_MIC_PORT, flush, sizeof(flush), &br, pdMS_TO_TICKS(16));
+            while (i2s_read(I2S_MIC_PORT, flush, sizeof(flush), &br, pdMS_TO_TICKS(5)) == ESP_OK && br > 0) {}
+            gateOpen = false;
+            gateOpenStreak = 0;
+            gateOpenedWithPreroll = false;
             continue;
         }
         // Hết 2.6s cửa sổ "nghe lệnh trong nhạc" -> mic tự đóng lại (nếu nhạc đang phát)
@@ -1660,7 +1727,11 @@ void micTask(void *param) {
 
         static unsigned long pausedSince = 0;
         bool inMicWindow = (micWindowEndMs != 0);
-        if ((ttsPlaying || micPausedByServer) && !inMicWindow) {
+        // NHẠC đang phát (ngoài cửa sổ nghe lệnh): bít mic như cũ - không tự nghe nhạc
+        bool musicPause = musicPlaying && micPausedByServer && !inMicWindow;
+        // TTS đang phát: chế độ BARGE GATE - mic sống, tự khử echo tiếng loa
+        bool bargeGate = bargeArmed && !musicPlaying && !inMicWindow;
+        if (musicPause) {
             if (pausedSince == 0) pausedSince = millis();
             else if (millis() - pausedSince > 15000) {
                 // Bảo hiểm: server ngắt ngang chưa kịp gửi __SPEAK_END__ -> tự mở mic lại
@@ -1674,6 +1745,14 @@ void micTask(void *param) {
             i2s_read(I2S_MIC_PORT, flush, sizeof(flush), &br, pdMS_TO_TICKS(5));
             continue;
         }
+        // [Watchdog] server treo giữa chừng (không __SPEAK_END__, ~20s không ping)
+        // -> mở lại mic, kẻo robot điếc vĩnh viễn
+        if (bargeGate && lastPingAtMs != 0 && millis() - lastPingAtMs > 20000) {
+            Serial.println("[BARGE] Canh bao: server khong dang ping -> mo lai mic");
+            bargeArmed = false;
+            ttsPlaying = false;
+            bargeGate = false;
+        }
         pausedSince = 0;
         int32_t rawChunk[MIC_CHUNK_SAMPLES];   // I2S 32-bit: INMP441 nạp 24/32 bit có dữ liệu
         int16_t chunk[MIC_CHUNK_SAMPLES];
@@ -1683,10 +1762,10 @@ void micTask(void *param) {
             int n = bytes_read / 4;
             // dịch phải 14 bit: 24-bit raw -> 16-bit có gain tự nhiên (nghe rõ xa 1m)
             for (int i = 0; i < n; i++) chunk[i] = (int16_t)(rawChunk[i] >> 14);
+            float sum = 0;
+            for (int i = 0; i < MIC_CHUNK_SAMPLES; i++) sum += (float)chunk[i] * chunk[i];
+            float rms = sqrt(sum / MIC_CHUNK_SAMPLES) / 32768.0f;
             if (MIC_DEBUG) {
-                float sum = 0;
-                for (int i = 0; i < MIC_CHUNK_SAMPLES; i++) sum += (float)chunk[i] * chunk[i];
-                float rms = sqrt(sum / MIC_CHUNK_SAMPLES) / 32768.0f;
                 if (rms > dbgPeakRMS) dbgPeakRMS = rms;
                 if (++dbgFrames >= 31) {         // kiem tra moi 0.5s
                     // Chi in log khi thuc su co am thanh, im lang khong in gi ca
@@ -1694,6 +1773,93 @@ void micTask(void *param) {
                         Serial.printf("[MIC] Phat hien am thanh: RMS = %.3f\n", dbgPeakRMS);
                     }
                     dbgFrames = 0; dbgPeakRMS = 0;
+                }
+            }
+            bool sendNow = true;
+            // ENERGY GATE chỉ áp ở chế độ nghe thường (mic không bị music/barge chi phối)
+            if (!musicPlaying && !inMicWindow && !bargeGate) {
+                float thr = fmax(GATE_ABS_FLOOR, gateNoiseEma * GATE_MULT);
+                if (!gateOpen) {
+                    if (rms > thr) { if (++gateOpenStreak >= GATE_OPEN_FRAMES) gateOpen = true; }
+                    else gateOpenStreak = 0;
+                }
+                if (gateOpen) {
+                    if (rms > thr * 0.5f) {
+                        gateLastActiveMs = millis();
+                    } else if (millis() - gateLastActiveMs > GATE_HANGOVER_MS) {
+                        gateOpen = false;
+                        gateOpenStreak = 0;
+                    }
+                    if (!gateOpen) sendNow = false;   // gate vừa đóng trong khung này
+                } else {
+                    // gate đang đóng: khung tiếp theo vượt ngưỡng là câu MỚI -> cần pre-roll
+                    gateOpenedWithPreroll = false;
+                    sendNow = false;
+                    // Nạp ring pre-roll 256ms + học nền nhiễu lúc phòng yên lặng
+                    memcpy(preRollRing[preRollIdx], chunk, n * 2);
+                    preRollIdx = (preRollIdx + 1) % PREROLLS;
+                    if (preRollIdx == 0) preRollFull = true;
+                    if (musicPlaying || bargeArmed || inMicWindow) {
+                        // loa đang phát -> echo KHÔNG phải nền nhiễu: bỏ qua, khỏi tăng sai
+                    } else if (rms < thr) {
+                        gateNoiseEma = 0.995f * gateNoiseEma + 0.005f * rms;
+                        if (gateNoiseEma < 0.001f) gateNoiseEma = 0.001f;
+                        if (gateNoiseEma > 0.05f)  gateNoiseEma = 0.05f;
+                    }
+                }
+                // Khung ĐẦU TIÊN khi gate mở: gửi trọn ring pre-roll (256ms quá khứ)
+                if (gateOpen && !gateOpenedWithPreroll) {
+                    gateOpenedWithPreroll = true;
+                    int start = preRollFull ? preRollIdx : 0;
+                    int cnt = preRollFull ? PREROLLS : start;
+                    for (int k = 0; k < cnt; k++) {
+                        int idx = (start + k) % PREROLLS;
+                        webSocket.sendBIN((uint8_t *)preRollRing[idx], MIC_CHUNK_SAMPLES * 2);
+                    }
+                    if (!preRollFull) memset(preRollRing, 0, sizeof(preRollRing));
+                }
+            }
+            if (bargeGate) {
+                echoMicRmsEma = 0.80f * echoMicRmsEma + 0.20f * rms;
+                // HỌC NHANH hệ số echo k: alpha 0.15 + median(3) loại frame "nói đè"
+                // (kNow vọt cao bất thường) -> k hội tụ ~0.15s thay vì 1-2s như trước
+                // (k=0.35 đoán sai -> ngưỡng kếch sù -> máy gần như điếc khi nói đè).
+                float expectedEcho = kCoupling * speakerRmsEma;
+                static float kMed[3] = {0, 0, 0};
+                static int kMedN = 0;
+                if (echoMicRmsEma > 1e-5f && speakerRmsEma > 1e-5f) {
+                    float kNow = echoMicRmsEma / speakerRmsEma;
+                    kMed[kMedN % 3] = kNow; kMedN++;
+                    float kUse = kNow;
+                    if (kMedN >= 3) {
+                        float a = kMed[0], b = kMed[1], c = kMed[2];
+                        kUse = a + b + c - fminf(fminf(a, b), c) - fmaxf(fmaxf(a, b), c);  // median 3
+                    }
+                    kCoupling = 0.85f * kCoupling + 0.15f * kUse;
+                    if (kCoupling < 0.05f) kCoupling = 0.05f;
+                    if (kCoupling > 2.0f) kCoupling = 2.0f;
+                }
+                // Ngưỡng THÍCH ỨNG theo echo thực tế + cần 3 khung "over" liên tiếp
+                // (median streak) để chống nhiễu đơn lẻ tự cắt lời robot.
+                float floorThr = BARGE_FLOOR + BARGE_REL_ECHO * expectedEcho;
+                float excess = rms - expectedEcho;
+                bool over = (rms > floorThr) && (excess > fminf(BARGE_EXCESS, expectedEcho * 0.5f));
+                if (over) {
+                    if (bargeStreak < 1000) bargeStreak++;
+                } else {
+                    bargeStreak -= 2;
+                    if (bargeStreak < 0) bargeStreak = 0;
+                }
+                if (bargeStreak >= BARGE_FRAMES && millis() >= bargeCooldownUntil) {
+                    bargeStreak = 0;
+                    bargeCooldownUntil = millis() + BARGE_COOLDOWN_MS;
+                    bargeArmed = false;      // mở mic bình thường, các khung sau đi thẳng lên server
+                    Serial.printf("[BARGE] mic=%.3f echo~%.3f (k=%.2f) -> NGAT CAU TRA LOI\n",
+                                  rms, expectedEcho, kCoupling);
+                    sendBargeIn("voice");
+                    // frame hiện tại là tiếng anh -> gửi luôn lên server
+                } else {
+                    continue;   // chưa đủ tin cậy: vứt frame (không tự nghe lại tiếng loa)
                 }
             }
             webSocket.sendBIN((uint8_t *)chunk, n * 2);  // n raw 32-bit -> n mẫu 16-bit
@@ -1752,6 +1918,12 @@ void speakerTask(void *param) {
 
         size_t n = chunk / 2;  // số sample mono 16-bit
         const int16_t *monoIn = (const int16_t *)out;
+
+        // Mức loa ĐANG PHÁT (RMS mono) - đầu vào cho bộ khử echo barge-in
+        float sSum = 0;
+        for (size_t s = 0; s < n; s++) sSum += (float)monoIn[s] * monoIn[s];
+        float sRms = sqrt(sSum / (n > 0 ? (float)n : 1.0f)) / 32768.0f;
+        speakerRmsEma = 0.55f * speakerRmsEma + 0.45f * sRms;   // hằng số ~100ms
 
         // Giữ trọn vẹn 100% biên độ mẫu để giọng nói to, tròn vành, rõ chữ
         for (size_t s = 0; s < n; s++) {

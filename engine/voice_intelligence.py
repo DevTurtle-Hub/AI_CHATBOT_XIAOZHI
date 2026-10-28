@@ -83,8 +83,7 @@ class AudioPreprocessor:
         if len(pcm_bytes) % 2 != 0:
             pcm_bytes = pcm_bytes[:-1]
 
-        # 1. Tiền lọc High-Pass cắt gió ù
-        pcm_bytes = AudioPreprocessor.highpass_filter(pcm_bytes, cutoff=110.0, sample_rate=sample_rate)
+        # High-Pass 110Hz đã được chạy Ở NGOÀI trong preprocess_for_stt (tránh lọc đúp)
 
         signal = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
         n_samples = len(signal)
@@ -155,13 +154,15 @@ class AudioPreprocessor:
         return AudioPreprocessor.farfield_adaptive_gain(pcm_bytes, target_peak=target_peak)
 
     @staticmethod
-    def farfield_adaptive_gain(pcm_bytes: bytes, target_peak: int = 24000, target_rms: float = 3800.0, max_gain: float = 140.0) -> bytes:
+    def farfield_adaptive_gain(pcm_bytes: bytes, target_peak: int = 24000, target_rms: float = 3800.0, max_gain: float = 35.0) -> bytes:
         """
-        BỘ TỰ ĐỘNG KHUẾCH ĐẠI GIỌNG NÓI TỪ XA (FAR-FIELD ADAPTIVE GAIN CONTROL):
-        - Hỗ trợ bắt giọng cực nhạy từ khoảng cách ~1 mét đến 2 mét
-        - Tự động tính toán RMS và đỉnh sóng
-        - Nếu âm lượng quá nhỏ (do nói xa): Tự động nhân hệ số bù gain lên đến 140x
-        - Đi kèm đường cong Soft-Knee Limiter mượt mà giữ cho âm thanh ấm áp, không bị rè méo khi nói sát mic
+        BỘ TỰ ĐỘNG KHUẾCH ĐẠI GIỌNG NÓI TỪ XA THÍCH NGHI ĐỘNG (ADAPTIVE DYNAMIC AGC):
+        - Hỗ trợ bắt giọng nhạy từ khoảng cách ~1 mét đến 3 mét
+        - Tự động đo lường mức nhiễu nền (noise floor):
+            + Phòng yên tĩnh (< 0.01): tăng trần gain lên tới 50x để nghe xa
+            + Bình thường (0.01 - 0.03): giữ trần an toàn 35x
+            + Phòng ồn ào/quạt gió (>= 0.03): siết trần xuống 20x chống bùng nổ nhiễu
+        - Đi kèm đường cong Soft-Knee Limiter mượt mà giữ âm thanh ấm áp, không méo khi nói gần
         """
         if len(pcm_bytes) < 2:
             return pcm_bytes
@@ -170,11 +171,29 @@ class AudioPreprocessor:
 
         signal = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
         peak = np.max(np.abs(signal))
-        if peak < 10.0:
+        # Nếu chỉ là tiếng thì thầm phòng/tạp âm cực nhỏ (<60), không khuếch đại tránh xì sàn
+        if peak < 60.0:
             return pcm_bytes
 
-        # Tính gain đưa âm thanh lên chuẩn target_peak (24000)
-        gain = float(min(target_peak / max(peak, 1.0), max_gain))
+        # Ước tính mức nhiễu nền từ 15% năng lượng khung thấp nhất
+        frame_sz = 320  # 20ms @ 16kHz
+        if len(signal) >= frame_sz:
+            n_f = len(signal) // frame_sz
+            f_rms = np.sqrt(np.mean(signal[:n_f * frame_sz].reshape(n_f, frame_sz) ** 2, axis=1) + 1e-12)
+            noise_floor_rms = float(np.percentile(f_rms, 15)) / 32768.0
+        else:
+            noise_floor_rms = float(np.std(signal)) / 32768.0
+
+        # Tự động điều chỉnh giới hạn khuếch đại thích nghi môi trường
+        if noise_floor_rms < 0.01:
+            effective_max_gain = max(max_gain, 50.0)
+        elif noise_floor_rms < 0.03:
+            effective_max_gain = min(max_gain, 35.0)
+        else:
+            effective_max_gain = min(max_gain, 20.0)
+
+        # Tính gain đưa âm thanh lên chuẩn target_peak (24000), hãm trần thích nghi
+        gain = float(min(target_peak / max(peak, 1.0), effective_max_gain))
 
         boosted = signal * gain
 

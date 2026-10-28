@@ -21,6 +21,7 @@ const { spawn } = require('child_process');
 const ytSearch = require('yt-search');
 
 const { STATES } = require('./src/core/state-machine');
+const { fetchPageText } = require('./src/ai/web-page');
 const protocol = require('./src/core/protocol');
 const { Session } = require('./src/core/session');
 const { TtsService } = require('./src/audio/tts-service');
@@ -58,8 +59,9 @@ const ttsService = new TtsService({
 
 let audioTraceSeq = 0;
 function newAudioTraceId() { return `${Date.now().toString(36)}-${(++audioTraceSeq).toString(36)}`; }
+const VERBOSE_LOG = process.env.XIAOXI_VERBOSE === '1';
 function logAudioTrace(traceId, stage, details = {}) {
-    console.log(`[AUDIO ${traceId}] ${stage} ${JSON.stringify(details)}`);
+    if (VERBOSE_LOG) console.log(`[AUDIO ${traceId}] ${stage} ${JSON.stringify(details)}`);
 }
 async function speakToESP32(ws, text, traceId = newAudioTraceId()) {
     return ttsService.speak(ws, text, {
@@ -100,14 +102,15 @@ function audioStats(pcm16) {
 }
 
 const GROQ_CHAT_MODEL  = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
-const GROQ_STT_MODEL   = 'whisper-large-v3-turbo';
+const GROQ_STT_MODEL   = process.env.GROQ_STT_MODEL || 'whisper-large-v3-turbo';
+const STT_PROVIDER     = (process.env.STT_PROVIDER || 'auto').toLowerCase(); // 'local' | 'groq' | 'auto'
 
 // ===== AI CASCADE: GEMINI ƯU TIÊN (free) -> GROQ FALLBACK (quota) =====
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 if (!GEMINI_API_KEY) console.warn('[⚠ CONFIG] GEMINI_API_KEY chưa đặt - mọi câu hỏi sẽ đốt quota Groq!');
 const GEMINI_MODEL   = process.env.GEMINI_MODEL || 'gemini-3-flash-preview';
-const AI_PRIMARY     = (process.env.AI_PRIMARY || 'gemini').toLowerCase(); // 'gemini' hoặc 'groq'
-const GEMINI_TIMEOUT = parseInt(process.env.GEMINI_TIMEOUT_MS || '6000');
+const AI_PRIMARY     = (process.env.AI_PRIMARY || 'race').toLowerCase(); // 'gemini' | 'groq' | 'race' (đua song song)
+const GEMINI_TIMEOUT = parseInt(process.env.GEMINI_TIMEOUT_MS || '3500');
 
 // Circuit-breaker: Gemini lỗi liên tiếp >= 2 lần -> nghỉ 10 phút, khỏi đốt thời gian mỗi câu (nhanh dứt khoát: 1 lần fail là chờ Groq ngay)
 let geminiFailStreak = 0;
@@ -130,52 +133,12 @@ function tftASCII(s) {
 // =========================================================================
 // 0c. TÂM TRẠNG & TRÒ CHUYỆN NHƯ NGƯỜI BẠN (đọc cảm xúc anh nói, nhắc chuyện cũ)
 // =========================================================================
-const convos = new Map(); // ws -> { mood: 'neutral', history: [{user, ai, mood}] }
-const MOOD_FACES = {
-    happy: '__FACE_HAPPY__', sad: '__FACE_SAD__', angry: '__FACE_ANGRY__',
-    surprise: '__FACE_SURPRISE__', love: '__FACE_LOVE__'
-};
-const MOOD_WORDS = {
-    happy:    ['vui', 'tuyệt', 'sướng', 'haha', 'cười', 'hay quá', 'thích', 'tuyệt vời', 'quá đã', 'hí hửng', 'được nè', 'trời ơi vui'],
-    sad:      ['buồn', 'mệt', 'chán', 'oải', 'áp lực', 'khổ', 'khóc', 'tủi thân', 'cô đơn', 'stress', 'quá tải', 'chán nản', 'không muốn nói chuyện với ai'],
-    angry:    ['tức', 'bực', 'giận', 'điên', 'khó chịu', 'bực mình', 'ghét', 'vô lý', 'ghen', 'dối trá', 'cãi nhau'],
-    surprise: ['hả', 'thật á', 'thật sao', 'kinh', 'bất ngờ', 'uầy', 'ủa', 'ố lên', 'trời đất'],
-    love:     ['yêu', 'thương', 'quý', 'nhớ anh', 'dễ thương', 'ngoan', 'bảo bối']
-};
-// Lexicon 0-token: điểm từ phía server (nhanh, không phụ thuộc engine) + hòa với SER âm học
-// MẸO: phải match NGUYÊN TỪ ("của" chuỗi con chứa "ủa" -> sai mood!) - tách token trước
-function lexiconMood(text) {
-    if (!text) return null;
-    const clean = ' ' + String(text).toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ') + ' ';
-    for (const [mood, words] of Object.entries(MOOD_WORDS)) {
-        if (words.some(w => clean.includes(' ' + w + ' '))) return mood;
-    }
-    return null;
-}
-// EMA: kéo mượt tâm trạng 0..1 cho mỗi loại + giọng nói SER weight 0.42, chữ 0.58
-function decideMood(ws, engineEmotion, transcript) {
-    const c = convos.get(ws) || { mood: 'neutral', history: [] };
-    convos.set(ws, c);
-    const lex = lexiconMood(transcript);
-    const ser = (engineEmotion && engineEmotion.emotion !== 'neutral') ? engineEmotion.emotion : null;
-    const pick = lex || ser || c.mood;          // chữ đè nhẹ lên giọng (rõ ràng hơn)
-    if (lex && ser && lex !== ser) {
-        // lệch: ưu tiên chữ khi engine SER tăng confidence dưới 0.5
-        const conf = engineEmotion?.confidence || 0;
-        c.mood = conf >= 0.55 ? ser : lex;
-    } else c.mood = pick;
-    return c.mood;
-}
-function moodHistoryBlock(ws) {
-    const c = convos.get(ws);
-    if (!c || !c.history.length) return '';
-    const recent = c.history.slice(-3).map(h =>
-        `Trước đó - anh nói: "${h.user}" (tâm trạng: ${h.mood}) | em trả lời: "${h.ai}"`);
-    return `\nChuyện vừa rồi: ${recent.join(' || ')}`;
-}
+const convos = new Map(); // ws -> { mood: 'neutral', pout: 0, history: [{user, ai, mood}] }
+const { MOOD_FACES, MOOD_TIP, lexiconMood, makeDecideMood } = require('./src/ai/mood');
+const decideMood = makeDecideMood(convos);
 function pushConvoHistory(ws, userText, aiReply, mood) {
     const c = convos.get(ws) || { mood: 'neutral', history: [] };
-    c.history.push({ user: String(userText).slice(0, 80), ai: String(aiReply).slice(0, 80), mood });
+    c.history.push({ user: String(userText).slice(0, 120), ai: String(aiReply).slice(0, 120), mood });
     if (c.history.length > 6) c.history.shift();     // nhớ 6 lượt gần nhất
     convos.set(ws, c);
     const session = sessions.get(ws);
@@ -184,15 +147,6 @@ function pushConvoHistory(ws, userText, aiReply, mood) {
     if (dbPool && aiReply) logChat('user', userText, mood);
     if (dbPool && aiReply) logChat('ai', aiReply, mood);
 }
-const MOOD_TIP = {
-    happy:    'Anh đang VUI: đáp chơi đùa, cùng hào hứng, cười đùa thân mật.',
-    sad:      'Anh nhà mình đang BUỒN/MỆT: dịu dàng, hỏi thăm "sao vậy anh", an ủi ngắn, không đùa cợt.',
-    angry:    'Anh đang GIẬN/ức: đứng về phía anh trước ("ừ đúng là nan thật quá"), xoa dịu, không giảng tính.',
-    surprise: 'Anh NGẠC NHIÊN: khớp sự ngạc nhiên ("oặc thật á?!"), tò mò hỏi kỹ.',
-    love:     'Anh YÊU THƯƠNG/NHỚ EM: đáp ấm áp tình cảm, xưng hô ngọt ("dạ anh Quy ơi").',
-    neutral:  'Bình thường thân thiện nhưng chịu khó hỏi lại 1 câu để tiếp chuyện.'
-};
-
 const dbPool = NEON_DB_URL ? new Pool({
     connectionString: NEON_DB_URL,
     max: 5,
@@ -230,6 +184,52 @@ function pcmToWav(pcmBuf, sampleRate = 16000, channels = 1, bitsPerSample = 16) 
     header.write('data', 36);
     header.writeUInt32LE(dataLen, 40);
     return Buffer.concat([header, pcmBuf]);
+}
+
+// =========================================================================
+// 2.8 WEB SEARCH KHÔNG CẦN KEY: DuckDuckGo Lite + Google News RSS (tiếng Việt)
+// Model tự gọi tool web_search khi câu hỏi cần tin MỚI ngoài dữ kiện cục bộ.
+// =========================================================================
+async function webSearchTool(query) {
+    // Model hay copy nguyên câu dài của user làm query -> báo chí/RSS không tìm thấy gì.
+    // Rút còn cụm khóa cốt lõi (tối đa 9 từ) trước khi search.
+    const q = String(query || '').toLowerCase()
+        .replace(/\b(tool|toàn bộ|tout bộ|trang web|website|đọc|mở|bằng|giúp anh|cho anh|nói cho anh|kết quả tìm kiếm|tìm bài viết|chi tiết)\b/gi, ' ')
+        .replace(/[^0-9a-zà-ỹ\s.,-]/gi, ' ')
+        .replace(/\s+/g, ' ').trim().split(' ').slice(0, 9).join(' ').slice(0, 120);
+    if (!q) return [];
+    const ua = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' };
+    const out = [];
+    try {
+        const r = await fetch('https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(q), { headers: ua, signal: AbortSignal.timeout(7000) });
+        const h = await r.text();
+        const links = [...h.matchAll(/<a[^>]*href="([^"]+)"[^>]*class=['"]result-link['"][^>]*>([\s\S]*?)<\/a>/g)];
+        const snips = [...h.matchAll(/class=['"]result-snippet['"][^>]*>([\s\S]*?)<\/td>/g)];
+        links.slice(0, 5).forEach((l, i) => {
+            let url = l[1];
+            const mU = url.match(/[?&]uddg=([^&]+)/);
+            if (mU) { try { url = decodeURIComponent(mU[1]); } catch (e) { } }
+            out.push({
+                title: l[2].replace(/<[^>]+>/g, '').trim(),
+                snippet: (snips[i]?.[1] || '').replace(/<[^>]+>/g, '').trim().slice(0, 300),
+                url: url.slice(0, 160)
+            });
+        });
+    } catch (e) { }
+    // Tin thời sự -> bồi thêm Google News RSS VN (có ngày đăng, rất đáng tin)
+    if (out.length < 3 || /(tin|hôm nay|mới nhất|kết quả|bóng đá|đá|giá|lãi|tuyển|bão|động đất|cháy)/i.test(q)) {
+        try {
+            const r = await fetch(`https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=vi&gl=VN&ceid=VN:vi`, { headers: ua, signal: AbortSignal.timeout(7000) });
+            const xml = await r.text();
+            for (const it of [...xml.matchAll(/<item>([\s\S]*?)<\/item>/g)].slice(0, 5)) {
+                const t = (it[1].match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/) || [])[1] || '';
+                const d = (it[1].match(/<pubDate>([^<]+)<\/pubDate>/) || [])[1] || '';
+                const title = t.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim();
+                if (title && !out.some(o => o.title === title)) out.push({ title, snippet: `Tin tức báo chí, đăng ngày ${d}`, url: '' });
+            }
+        } catch (e) { }
+    }
+    return out.slice(0, 7);
 }
 
 // =========================================================================
@@ -283,6 +283,49 @@ const AI_TOOLS = [
     {
         type: "function",
         function: {
+            name: "set_reminder",
+            description: "Đặt lời nhắc chủ động: đúng giờ hẹn robot sẽ tự cất tiếng nhắc anh Quy qua loa. Dùng khi anh dặn 'nhắc anh ... lúc .../ngày ...' mà câu chưa được xử lý sẵn.",
+            parameters: {
+                type: "object",
+                properties: {
+                    note: { type: "string", description: "Việc cần nhắc, cực ngắn (vd 'uống thuốc', 'nạp thẻ')" },
+                    when: { type: "string", description: "Thời điểm theo GIỜ ĐỊA PHƯƠNG máy chủ (giờ VN), dạng 'YYYY-MM-DDTHH:MM' hoặc 'YYYY-MM-DD HH:MM'. VD hôm nay 20h30: '2026-10-28T20:30'" }
+                },
+                required: ["note", "when"]
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "web_search",
+            description: "Tìm kiếm web thật (có kết quả mới nhất hôm nay). Dùng cho: tin tức/thời sự, giá cả (vàng, xăng, tỷ giá...), kết quả bóng đá, sự kiện gần đây, nhân vật hiện tại, hoặc bất kỳ facts nào em KHÔNG CHẮC. KHÔNG dùng cho trò chuyện, cảm xúc, kiến thức phổ thông.",
+            parameters: {
+                type: "object",
+                properties: {
+                    query: { type: "string", description: "Từ khóa tìm kiếm tiếng Việt ngắn gọn, vd 'giá vàng hôm nay'" }
+                },
+                required: ["query"]
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "read_page",
+            description: "Đọc TOÀN VĂN một trang web khi kết quả web_search (snippet) chưa đủ chi tiết - vd bảng giá mua/bán, bài viết đầy đủ. Chỉ dùng url lấy từ kết quả web_search.",
+            parameters: {
+                type: "object",
+                properties: {
+                    url: { type: "string", description: "URL trang cần đọc (từ web_search)" }
+                },
+                required: ["url"]
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
             name: "music_player",
             description: "Điều khiển NHẠC trên robot: play (mở hiểu bài theo tiêu đề/ca sĩ/chỉ mood), stop, pause, resume, next. Dùng khi anh Quy mong nghe/bắt/bạn dừng/bài khác.",
             parameters: {
@@ -297,25 +340,34 @@ const AI_TOOLS = [
     }
 ];
 
-async function callUniversalLLM({ messages, tools = null, temperature = 0.6, max_tokens = 150 }) {
-    const res = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
-        model: GROQ_CHAT_MODEL,
-        messages,
-        tools,
-        temperature,
-        max_tokens
-    }, {
+async function callUniversalLLM({ messages, tools = null, temperature = 0.6, max_tokens = 300, timeoutMs = 9000 }) {
+    const body = { model: GROQ_CHAT_MODEL, messages, tools, temperature, max_tokens };
+    const cfg = {
         headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
         httpAgent: groqHttpAgent,
-        timeout: 9000
-    });
-    return res.data;
+        timeout: timeoutMs
+    };
+    try {
+        const res = await axios.post('https://api.groq.com/openai/v1/chat/completions', body, cfg);
+        return res.data;
+    } catch (e) {
+        // 429 = vượt RPM của tier miễn phí (thường xuyên khi 1 lượt đốt 2-3 call
+        // tool liên tiếp) -> chờ rồi thử lại ĐÚNG 1 lần, không dây dưa latency
+        if (e.response?.status === 429) {
+            const waitMs = 10000 + Math.floor(Math.random() * 4000);
+            if (VERBOSE_LOG) console.warn(`[GROQ] 429 rate-limit, đợi ${(waitMs / 1000).toFixed(0)}s thử lại...`);
+            await new Promise(r => setTimeout(r, waitMs));
+            const res2 = await axios.post('https://api.groq.com/openai/v1/chat/completions', body, cfg);
+            return res2.data;
+        }
+        throw e;
+    }
 }
 
 // =========================================================================
 // 2.5 TẦNG GEMINI (ưu tiên - miễn phí, tiết kiệm quota Groq)
 // =========================================================================
-async function askGemini(systemPrompt, userQuestion) {
+async function askGemini(systemPrompt, userQuestion, history = []) {
     if (!GEMINI_API_KEY) return null;
     if (Date.now() < geminiCooldownUntil) return null;
     try {
@@ -323,8 +375,11 @@ async function askGemini(systemPrompt, userQuestion) {
             `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
             {
                 system_instruction: { parts: [{ text: systemPrompt }] },
-                contents: [{ role: 'user', parts: [{ text: userQuestion.slice(0, 400) }] }],
-                generationConfig: { temperature: 0.55, maxOutputTokens: 160 }
+                contents: [
+                    ...history,
+                    { role: 'user', parts: [{ text: userQuestion.slice(0, 1200) }] }
+                ],
+                generationConfig: { temperature: 0.6, maxOutputTokens: 300 }
             },
             {
                 headers: { 'x-goog-api-key': GEMINI_API_KEY, 'Content-Type': 'application/json' },
@@ -336,15 +391,22 @@ async function askGemini(systemPrompt, userQuestion) {
         if (!text) throw new Error('Gemini trả về rỗng');
         geminiFailStreak = 0;
         aiStats.gemini++; aiStats.total++;
-        console.log(`[🧠 GEMINI OK] ${GEMINI_MODEL} | ${aiStatsLine()}`);
+        if (VERBOSE_LOG) console.log(`[🧠 GEMINI OK] ${GEMINI_MODEL} | ${aiStatsLine()}`);
         return text;
     } catch (e) {
-        geminiFailStreak++;
-        if (geminiFailStreak >= 2) {
-            geminiCooldownUntil = Date.now() + 10 * 60000;
-            console.warn(`[AI] Gemini lỗi x${geminiFailStreak} -> nghỉ 10 phút, chuyển hẳn sang Groq (${e.message})`);
+        const status = e.response?.status;
+        if (status === 401 || status === 403) {
+            // Key sai/hết hạn vĩnh viễn -> nghỉ 7 ngày (coi như tắt Gemini), Groq lo hết.
+            geminiCooldownUntil = Date.now() + 7 * 24 * 3600 * 1000;
+            console.warn('[AI] GEMINI_API_KEY KHÔNG HỢP LỆ (401) -> tắt Gemini. Lấy key mới dạng AIza... tại https://aistudio.google.com/apikey rồi cập nhật .env');
         } else {
-            console.warn(`[AI] Gemini thất bại (lần ${geminiFailStreak}) -> fallback Groq: ${e.message}`);
+            geminiFailStreak++;
+            if (geminiFailStreak >= 2) {
+                geminiCooldownUntil = Date.now() + 10 * 60000;
+                console.warn(`[AI] Gemini lỗi x${geminiFailStreak} -> nghỉ 10 phút, chuyển hẳn sang Groq (${e.message})`);
+            } else {
+                console.warn(`[AI] Gemini thất bại (lần ${geminiFailStreak}) -> fallback Groq: ${e.message}`);
+            }
         }
         return null;
     }
@@ -354,6 +416,46 @@ async function askGemini(systemPrompt, userQuestion) {
 // 2.6 BỘ ĐỊNH TUYẾN CỤC BỘ (0 TOKEN): lệnh servo + ghi nhớ theo mẫu câu
 // Chỉ khi không khớp mẫu nào mới đốt token gọi LLM
 // =========================================================================
+// "nhắc anh uống thuốc sau 30 phút" / "lúc 7 giờ nhắc anh tập" -> {note, dueMs, label}
+function tryParseReminder(text) {
+    const raw = String(text || '').toLowerCase();
+    if (!/nhắ[ck]/.test(raw)) return null;
+    if (/nhắ[ck]\s+(lại|lai)\b/.test(raw)) return null;   // "nhắc lại" = lặp câu, không phải lời nhắc
+    const NUMW = { 'một': 1, 'mot': 1, 'hai': 2, 'ba': 3, 'bốn': 4, 'bon': 4, 'năm': 5, 'nam': 5, 'sáu': 6, 'bay': 7, 'bảy': 7, 'tám': 8, 'tam': 8, 'chín': 9, 'chin': 9, 'mười': 10, 'muoi': 10 };
+    const num = (s) => /^\d+$/.test(s) ? +s : (NUMW[s] ?? null);
+    const now = new Date();
+    let due = null, m;
+    const W = '([0-9]+|[a-zà-ỹ]+)';
+    if ((m = raw.match(new RegExp(`sau\\s+${W}\\s+ph[uú]t`)))) {
+        const n = num(m[1]); if (n) due = new Date(now.getTime() + n * 60000);
+    } else if (/sau\s+[a-zà-ỹ0-9]+\s*(nửa|half)\s*ti[ếe]ng/.test(raw) || /nửa\s*tiếng/.test(raw)) {
+        due = new Date(now.getTime() + 30 * 60000);
+    } else if ((m = raw.match(new RegExp(`sau\\s+${W}\\s+ti[ếe]ng`)))) {
+        const n = num(m[1]); if (n) due = new Date(now.getTime() + n * 3600000);
+    } else if ((m = raw.match(/(\d{1,2})\s*[h:]?\s*(\d{1,2})?(?:\s*gi[ờe])?/)) && /\d/.test(m[1]) && /gi[ờe]|\d{1,2}\s*[h:]|\d{1,2}:\d{1,2}/.test(raw)) {
+        let hh = num(m[1]); const mm = m[2] ? +m[2] : 0;
+        if (hh == null || hh > 23 || mm > 59) return null;
+        if (/(tối|toi|chiều|chieu)/.test(raw) && hh < 12) hh += 12;
+        if (/sáng|sang/.test(raw) && hh === 12) hh = 0;
+        due = new Date(now); due.setHours(hh, mm, 0, 0);
+        if (/ngày mai|ngay mai|sáng mai|tối mai|chiều mai/.test(raw)) due.setDate(due.getDate() + 1);
+        else if (due <= now) due.setDate(due.getDate() + 1);
+    }
+    if (!due || due.getTime() - now.getTime() < 15000) return null;   // <15giây thì chưa kịp lịch -> để LLM/chat trả lời
+    const ni = raw.search(/nhắ[ck]/);
+    let rest = raw.slice(ni).replace(/^nhắ[ck]\s+/, '')
+        .replace(/^(anh|em|giúp|giùm|cho|với|được|nhé|nha|là|rằng|giúp\s+em)\s+/i, '').trim();
+    const ti = rest.search(/\b(lúc|luc|vào lúc|sau|sang|tối\s+nay|ngày\s+mai|ngay\s+mai)\b|\d{1,2}[h:]|([0-9]+|[a-zà-ỹ]{2,5})\s*gi[ờe]/);
+    let note = (ti >= 0 ? rest.slice(0, ti) : rest)
+        .replace(/^(lúc|luc|vào lúc|ngày mai|ngay mai)\s+/, '')
+        .replace(/[.,!?~]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!note || note.length < 2) note = 'việc anh dặn';
+    const hh = String(due.getHours()).padStart(2, '0'), mm = String(due.getMinutes()).padStart(2, '0');
+    const sameDay = due.getDate() === now.getDate() && due.getMonth() === now.getMonth();
+    const label = sameDay ? `${hh}:${mm} hôm nay` : `${hh}:${mm} ngày ${due.getDate()}/${due.getMonth() + 1}`;
+    return { note: note.slice(0, 200), dueMs: due.getTime(), label };
+}
+
 function routeLocalCommand(text, isOwner) {
     if (!text) return null;
     const t = ' ' + text.toLowerCase().replace(/[.,!?~]/g, ' ') + ' ';
@@ -380,6 +482,13 @@ function routeLocalCommand(text, isOwner) {
         }
     }
 
+    // 1b) LỜI NHẮC HẸN 0-TOKEN: "nhắc anh X lúc Y / sau N phút"
+    const remParse = tryParseReminder(text);
+    if (remParse) {
+        if (!isOwner) return { type: 'servoDeny', reply: 'Dạ em xin lỗi, chỉ có anh Quy mới đặt lời nhắc em thôi ạ!' };
+        return { type: 'reminder', note: remParse.note, dueMs: remParse.dueMs, whenLabel: remParse.label, reply: '' };
+    }
+
     // 2) Lệnh điều khiển servo (chỉ chủ nhân mới được điều khiển)
     const cmds = [];
     if (has('đầu lên', 'ngẩng lên', 'nhấc đầu lên', 'gập đầu lên')) cmds.push('__SERVO_HEAD_UP__');
@@ -402,6 +511,21 @@ function routeLocalCommand(text, isOwner) {
     if (md) {
         if (!isOwner) { console.log('[🔒 BAO MAT] Khach yeu cau dieu khien nhac -> tu choi'); return { type: 'servoDeny', reply: 'Dạ em xin lỗi, chỉ có anh Quy mới được điều khiển em thôi ạ!' }; }
         return { type: 'music', action: md.action, query: md.query, reply: '' };
+    }
+
+    // 4) ĐỒNG HỒ 0-TOKEN: đọc đồng hồ thật chính xác hơn để LLM đoán
+    if (has('mấy giờ', 'bao gio', 'what time')) {
+        const d = new Date();
+        const hh = String(d.getHours()).padStart(2, '0');
+        const mm = String(d.getMinutes()).padStart(2, '0');
+        const thu = ['Chủ nhật', 'Thứ hai', 'Thứ ba', 'Thứ tư', 'Thứ năm', 'Thứ sáu', 'Thứ bảy'][d.getDay()];
+        const gio = mm === '00' ? `${hh} giờ đúng` : `${hh} giờ ${mm}`;
+        return { type: 'clock', reply: `Bây giờ là ${gio}, ${thu} ngày ${d.getDate()}/${d.getMonth() + 1} ạ.` };
+    }
+
+    // 5) THỜI TIẾT 0-TOKEN: đọc cache open-meteo (số liệu thật, không để model bịa)
+    if (has('thời tiết', 'weather', 'bao nhiêu độ', 'nóng không', 'mưa không')) {
+        return { type: 'weather', reply: '' };
     }
 
     return null;
@@ -429,14 +553,18 @@ function routeMusicCommand(text) {
     if (!text) return null;
     const t = ' ' + String(text).toLowerCase().replace(/[.,!?~]/g, ' ') + ' ';
     const has = (...w) => w.some(x => t.includes(x));
-    if (has(' tạm dừng', ' tạm dùng', ' tạm ngừng', ' dừng nhạc lại')) return { action: 'pause' };
-    if (has(' tắt nhạc', ' tắt bài', ' dừng nhạc', ' tắt đi', ' nhạc thôi')) return { action: 'stop' };
-    if (has(' tiếp tục', ' phát tiếp', ' phát lại', ' mở lại nhạc')) return { action: 'resume' };
-    if (has(' bài khác', ' đổi bài', ' bài tiếp', ' bai khac')) return { action: 'next' };
-    if (has(' mở nhạc', ' phát nhạc', ' nghe nhạc', ' mở bài', ' phát bài', ' bật nhạc',
+    // "tắt đèn đi"/"tắt quạt đi" KHÔNG phải lệnh nhạc - trả null để route thiết bị khác/LLM xử
+    if (has('đèn', 'quat', 'quạt')) return null;
+    // "đọc trang/chi tiết/bài viết..." KHÔNG phải lệnh nhạc - để LLM + web tools xử
+    if (has('trang', 'web', 'chi tiết', 'bài giảng', 'bài tập', 'bài viết', 'tài liệu', 'đọc')) return null;
+    if (has(' tạm dùng', ' tạm dừng', ' tạm ngừng', ' dừng lại nhạc', ' nhạc dừng')) return { action: 'pause' };
+    if (has(' tắt nhạc', ' tắt bài hát', ' tắt bài nhạc', ' tắt bản nhạc', ' dừng nhạc', ' tắt tiếng nhạc', ' tắt nhạc đi', ' nhạc tắt đi', ' nhạc thôi')) return { action: 'stop' };
+    if (has(' tiếp tục nhạc', ' tiếp tục bài', ' phát tiếp', ' phát lại nhạc', ' mở lại nhạc', ' nhạc tiếp tục')) return { action: 'resume' };
+    if (has(' bài hát khác', ' bản nhạc khác', ' đổi bài hát', ' đổi nhạc', ' bài khác nhạc', ' nhạc bài khác')) return { action: 'next' };
+    if (has(' mở nhạc', ' phát nhạc', ' nghe nhạc', ' bật nhạc', ' mở bài hát', ' phát bài hát', ' mở bài', ' phát bài',
             ' cho anh nghe nhạc', ' cho anh nghe bài', ' cho anh hát', ' nhac di', ' mở hơi nhạc')) {
-        // Ch CHIP: lấy đoạn sau chốt từ khóa ("mở nhạc"/"phát bài"...) làm tên bài
-        const anchors = ['mở nhạc', 'phát nhạc', 'nghe nhạc', 'mở bài', 'phát bài',
+        // Ch CHIP: lấy đoạn sau chốt từ khóa ("mở nhạc"/"phát bài hát"...) làm tên bài
+        const anchors = ['mở nhạc', 'phát nhạc', 'nghe nhạc', 'mở bài hát', 'phát bài hát', 'mở bài', 'phát bài',
             'cho anh nghe nhạc', 'cho anh nghe bài', 'cho anh hát', 'bật nhạc', 'nhac di', 'mở hơi nhạc'];
         let q = text.toLowerCase();
         for (const a of anchors) {
@@ -630,23 +758,112 @@ async function runMusicAction(ws, action, query) {
 // =========================================================================
 // 3. STT & BỘ LỌC CÂU HỎI THÔNG MINH (ANTI-HALLUCINATION)
 // =========================================================================
-async function transcribeAudio(buffer) {
+const DOMAIN_STT_PROMPT = 'Đây là hội thoại bằng tiếng Việt với robot trợ lý thông minh tên là XiaoXi. Người dùng đưa khẩu lệnh điều khiển thiết bị, cử chỉ robot hoặc hỏi đáp thông tin. Các từ khóa và khẩu lệnh thường dùng: XiaoXi ơi, em ơi, bật đèn, tắt đèn, bật quạt, tắt quạt, mở nhạc, tắt nhạc, phát nhạc, gập đầu, cúi đầu, ngẩng đầu lên, nhìn thẳng, quay trái, quay phải, thời tiết hôm nay thế nào, mấy giờ rồi, ghi nhớ giúp anh, nhắc anh, kể chuyện, hôm nay vui quá, tạm biệt.';
+
+function normalizeVoiceText(text) {
+    if (!text || typeof text !== 'string') return '';
+    let s = text.trim();
+
+    // 1. Chuẩn hoá các biến thể gọi tên robot (giọng địa phương, phiên âm nhầm):
+    s = s.replace(/\b(xi\s+)?xiaomi(\s+ơi)?\b/gi, 'XiaoXi');
+    s = s.replace(/\b(tiểu\s*hi|tiêu\s*hy|tiêu\s*hi|xỉu\s*xi|xì\s*xi|xảo\s*xi|xao\s*xi|sao\s*xi|siao\s*xi|cậu\s*xi|bạn\s*xi|xi\s*ơi|chào\s*xi|chao\s*xi|ê\s*xi|hey\s*xi)\b/gi, 'XiaoXi');
+    s = s.replace(/\b(xiao\s*si|siao\s*si|sieu\s*si|siêu\s*xi|siêu\s*si|tiểu\s*trí|tiểu\s*tri)\b/gi, 'XiaoXi');
+    s = s.replace(/\b(xiao\s*xi)\b/gi, 'XiaoXi');
+
+    // 2. Sửa lỗi chính tả âm vần thường gặp từ Whisper đối với robot cử chỉ & thiết bị
+    s = s.replace(/\b(gặp\s+đầu)\b/gi, 'gập đầu');
+    s = s.replace(/\b(ngẫng\s+đầu|ngước\s+đầu|ngẩng\s+mặt)\b/gi, 'ngẩng đầu');
+
+    // 3. Chuẩn hoá các khẩu lệnh thường dùng (rút gọn từ đệm, nói lắp, từ thừa)
+    // Đèn
+    s = s.replace(/\b(làm\s+ơn\s+)?(bật|mở)\s+(giùm\s+)?(cái\s+)?đèn(\s+(lên|đi|giúp\s+anh|hộ\s+anh))?\b/gi, 'bật đèn');
+    s = s.replace(/\b(làm\s+ơn\s+)?tắt\s+(giùm\s+)?(cái\s+)?đèn(\s+(đi|giúp\s+anh|hộ\s+anh))?\b/gi, 'tắt đèn');
+    s = s.replace(/\b(tắt\s+hết\s+mọi\s+thứ|đóng\s+hết|tắt\s+hết\s+đi|tắt\s+tất\s+cả\s+đi|tắt\s+toàn\s+bộ)\b/gi, 'tắt tất cả');
+
+    // Quạt
+    s = s.replace(/\b(làm\s+ơn\s+)?(bật|mở)\s+(giùm\s+)?(cái\s+)?quạt(\s+(lên|đi|giúp\s+anh|hộ\s+anh))?\b/gi, 'bật quạt');
+    s = s.replace(/\b(làm\s+ơn\s+)?tắt\s+(giùm\s+)?(cái\s+)?quạt(\s+(đi|giúp\s+anh|hộ\s+anh))?\b/gi, 'tắt quạt');
+
+    // Cử chỉ robot
+    s = s.replace(/\b(gập\s+đầu\s+lên(\s+đi)?)\b/gi, 'gập đầu lên');
+    s = s.replace(/\b(gập\s+đầu\s+xuống|cúi\s+đầu\s+xuống|cúi\s+đầu(\s+đi)?)\b/gi, 'cúi đầu');
+    s = s.replace(/\b(ngẩng\s+đầu\s+lên(\s+đi)?|ngước\s+đầu\s+lên(\s+đi)?)\b/gi, 'ngẩng đầu lên');
+    s = s.replace(/\b(nhìn\s+thẳng(\s+đi)?|quay\s+về\s+giữa|nhìn\s+về\s+phía\s+trước)\b/gi, 'nhìn thẳng');
+    s = s.replace(/\b(quay\s+sang\s+trái(\s+đi)?|ngoảnh\s+trái(\s+đi)?|nhìn\s+sang\s+trái)\b/gi, 'quay trái');
+    s = s.replace(/\b(quay\s+sang\s+phải(\s+đi)?|ngoảnh\s+phải(\s+đi)?|nhìn\s+sang\s+phải)\b/gi, 'quay phải');
+
+    // Âm nhạc & Trợ lý
+    s = s.replace(/\b(dừng\s+lại(\s+đi)?|thôi\s+dừng|ngừng\s+lại|dừng\s+phát|dừng\s+nhạc)\b/gi, 'dừng lại');
+    s = s.replace(/\b(im\s+lặng(\s+đi)?|im\s+miệng|trật\s+tự(\s+đi)?|im\s+đi)\b/gi, 'im lặng');
+    s = s.replace(/\b(bây\s+giờ\s+(là\s+)?mấy\s+giờ|xem\s+giờ\s+giúp\s+anh|mấy\s+giờ\s+rồi\s+em|mấy\s+giờ\s+rồi)\b/gi, 'mấy giờ rồi');
+    s = s.replace(/\b(dự\s+báo\s+thời\s+tiết|thời\s+tiết\s+hôm\s+nay\s+ra\s+sao|xem\s+thời\s+tiết\s+giúp\s+anh|thời\s+tiết\s+thế\s+nào)\b/gi, 'thời tiết hôm nay thế nào');
+    s = s.replace(/\b(kể\s+chuyện\s+gì\s+đi|kể\s+chuyện\s+cho\s+anh\s+nghe|kể\s+một\s+câu\s+chuyện)\b/gi, 'kể chuyện');
+    s = s.replace(/\b(hát\s+cho\s+anh\s+nghe|hát\s+một\s+bài(\s+đi)?|hát\s+đi\s+em)\b/gi, 'hát đi');
+
+    return s;
+}
+
+async function transcribeWithLocal(buffer) {
+    const res = await axiosVoice.post('/stt', buffer, {
+        headers: { 'Content-Type': 'application/octet-stream' },
+        params: { prompt: DOMAIN_STT_PROMPT },
+        timeout: 15000
+    });
+    const rawText = (res.data?.text || '').trim();
+    const text = normalizeVoiceText(rawText);
+    return {
+        text,
+        segments: res.data?.segments || [],
+        confidence: res.data?.confidence ?? 1.0,
+        isUncertain: Boolean(res.data?.is_uncertain),
+        provider: 'local'
+    };
+}
+
+async function transcribeWithGroq(buffer) {
     const wavBuf = pcmToWav(buffer);
     const form = new FormData();
     form.append('file', wavBuf, { filename: 'audio.wav', contentType: 'audio/wav' });
     form.append('model', GROQ_STT_MODEL);
     form.append('language', 'vi');
+    form.append('temperature', '0');
     form.append('response_format', 'verbose_json');
-    // Prompt-bias giúp Whisper KHÔNG nuốt cụm gọi robot ("em ơi", "XiaoXi ơi")
-    form.append('prompt', 'Chào anh Quy! Đây là lệnh cho robot XiaoXi: "XiaoXi ơi", "em ơi", "kể cho anh nghe", "ghi nhớ giúp anh", "nhớ giúp anh"...');
+    form.append('prompt', DOMAIN_STT_PROMPT);
 
     const res = await axios.post('https://api.groq.com/openai/v1/audio/transcriptions', form, {
         headers: { ...form.getHeaders(), 'Authorization': `Bearer ${GROQ_API_KEY}` },
         httpAgent: groqHttpAgent,
         timeout: 8000
     });
-    const text = (res.data?.text || '').trim();
-    return { text, segments: res.data?.segments || [] };
+    const rawText = (res.data?.text || '').trim();
+    const text = normalizeVoiceText(rawText);
+    return {
+        text,
+        segments: res.data?.segments || [],
+        confidence: 1.0,
+        isUncertain: false,
+        provider: 'groq'
+    };
+}
+
+async function transcribeAudio(buffer) {
+    if (STT_PROVIDER === 'local') {
+        return await transcribeWithLocal(buffer);
+    }
+    if (STT_PROVIDER === 'groq') {
+        return await transcribeWithGroq(buffer);
+    }
+    // STT_PROVIDER === 'auto': Ưu tiên faster-whisper cục bộ trong RAM (0 disk I/O, nhanh, bảo mật)
+    // Nếu local timeout hoặc rỗng -> tự động fallback sang Groq cloud
+    try {
+        const localRes = await transcribeWithLocal(buffer);
+        if (localRes && localRes.text) {
+            return localRes;
+        }
+    } catch (err) {
+        console.warn('[STT] Local faster-whisper loi -> fallback Groq: ' + err.message);
+    }
+    return await transcribeWithGroq(buffer);
 }
 
 function isAnswerableRetrieval(text, acousticContext = {}, segments = []) {
@@ -704,15 +921,15 @@ async function refreshMemoriesCache() {
 }
 setInterval(refreshMemoriesCache, 60000).unref?.();
 
-async function addMemoryToDB(category, keyName, content) {
+async function addMemoryToDB(category, keyName, content, remindAt = null) {
     if (!dbPool) { userMemoriesCache.push({ category, key_name: keyName, content }); return; }
     try {
         await dbPool.query(
-            `INSERT INTO user_memories (category, key_name, content)
-             VALUES ($1, $2, $3)`,
-            [category, keyName, content]
+            `INSERT INTO user_memories (category, key_name, content, remind_at)
+             VALUES ($1, $2, $3, $4)`,
+            [category, keyName, content, remindAt ? new Date(remindAt) : null]
         );
-        console.log(`[DB] Đã ghi nhớ:[${category}] ${keyName} -> ${content}`);
+        if (VERBOSE_LOG) console.log(`[DB] Đã ghi nhớ:[${category}] ${keyName} -> ${content}`);
         await refreshMemoriesCache();
     } catch (e) {
         console.error('[DB] Lỗi ghi trí nhớ:', e.message);
@@ -727,10 +944,27 @@ function findMemories(keyword) {
     ).slice(0, 20);
 }
 
+// Xếp hạng trí nhớ theo độ liên quan với câu hỏi (từ khóa khớp), bộ nhớ mới hơn làm nền
+function rankMemories(text, limit = 6) {
+    const STOP = new Set(['hôm', 'nay', 'bây', 'giờ', 'cái', 'nào', 'vậy', 'sao', 'giúp', 'cho', 'anh', 'em', 'thì', 'là', 'của', 'và', 'rồi', 'đó', 'này', 'khi', 'nào', 'bạn', 'mình', 'về', 'has', 'what', 'the']);
+    const words = [...new Set(String(text || '').toLowerCase()
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/)
+        .filter(w => w.length >= 2 && !STOP.has(w)))];
+    const scored = userMemoriesCache.map((m, i) => {
+        const hay = `${m.key_name} ${m.content} ${m.category}`.toLowerCase();
+        let score = 0;
+        for (const w of words) if (hay.includes(w)) score += 2;
+        return { m, score, recency: userMemoriesCache.length - i };
+    }).sort((a, b) => b.score - a.score || b.recency - a.recency);
+    return scored.slice(0, limit).map(x => x.m);
+}
+
 // =========================================================================
 // 4c. ĐỒNG HỒ + THỜI TIẾT QUÁN MÀN HÌNH (open-meteo miễn phí, cache 10 phút)
 // =========================================================================
-let wxCache = { at: 0, line: '' };
+let wxCache = { at: 0, line: '', temp: null, humidity: null, code: null };
+// Bản có dấu để TTS nói tự nhiên (bản không dấu phía trên dành cho màn TFT)
+const WX_SPEAK = { 0: 'trời nắng', 1: 'trời nắng', 2: 'nắng nhẹ, trời trong', 3: 'trời nhiều mây', 45: 'có sương mù', 48: 'sương mù dày', 51: 'mưa phùn nhẹ', 53: 'mưa phùn', 55: 'mưa phùn', 61: 'có mưa', 63: 'mưa vừa', 65: 'mưa to', 66: 'mưa to', 67: 'mưa rất to', 71: 'có tuyết', 73: 'có tuyết', 75: 'tuyết rơi dày', 77: 'có tuyết', 80: 'mưa rào', 81: 'mưa rào', 82: 'mưa rào to', 85: 'mưa rào', 86: 'mưa đá', 95: 'có dông', 96: 'dông kèm mưa đá', 99: 'dông kèm mưa đá' };
 const WX_CODES = {
     0: 'tro nang', 1: 'tro nang', 2: 'it may', 3: 'may tro', 45: 'suong mu', 48: 'suong mu',
     51: 'muoi roi', 53: 'muoi roi', 55: 'muoi roi', 61: 'mua', 63: 'mua', 65: 'mua to',
@@ -746,7 +980,8 @@ async function refreshWeather() {
         const r = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,weather_code`, { signal: AbortSignal.timeout(6000) });
         const j = await r.json();
         const c = j.current;
-        wxCache = { at: Date.now(), line: `${Math.round(c.temperature_2m)}C ${WX_CODES[c.weather_code] || 'tro nang'} ${Math.round(c.relative_humidity_2m)}%` };
+        const temp = Math.round(c.temperature_2m), hum = Math.round(c.relative_humidity_2m);
+        wxCache = { at: Date.now(), line: `${temp}C ${WX_CODES[c.weather_code] || 'tro nang'} ${hum}%`, temp, humidity: hum, code: c.weather_code };
         console.log(`[TFT] Thời tiết: ${wxCache.line}`);
     } catch (e) {
         wxCache.at = Date.now() - 540000; // 1 phút sau thử lại
@@ -761,6 +996,46 @@ function sendTftAmbient(ws) {
     if (wxCache.line) { try { ws.send(`__WX__${wxCache.line}`); } catch (e) {} }
 }
 setInterval(() => { refreshWeather().then(() => { for (const c of deviceClients) sendTftAmbient(c); }); }, 60000).unref?.();
+
+// =========================================================================
+// 4d. LỜI NHẮC HẸN: robot CHỦ ĐỘNG cất tiếng nhắc khi đến hẹn (DB là nguồn
+// thật -> nhớ cả qua restart). Khi robot đang bận (nói/nhạc) -> để lần quét sau.
+// =========================================================================
+const REMINDER_SWEEP_MS = Math.max(5000, Number(process.env.XIAOXI_REMINDER_SWEEP_MS) || 30000);
+async function sweepReminders() {
+    if (!dbPool) return;
+    let rows;
+    try {
+        const res = await dbPool.query(
+            `SELECT id, content FROM user_memories
+             WHERE category = 'reminder' AND is_done = FALSE AND remind_at IS NOT NULL AND remind_at <= NOW()
+             ORDER BY remind_at LIMIT 3`);
+        rows = res.rows;
+    } catch (e) { return; }
+    if (!rows.length) return;
+    const ws = [...deviceClients].find(w => w.readyState === 1);
+    const session = ws && sessions.get(ws);
+    if (!ws || !session || session.busyTurn) return;   // robot offline/bận -> giữ nguyên, quét lại sau
+    for (const row of rows) {
+        try {
+            await dbPool.query('UPDATE user_memories SET is_done = TRUE, updated_at = NOW() WHERE id = $1 AND is_done = FALSE', [row.id]);
+        } catch (e) { continue; }
+        const text = `Dạ, đến giờ rồi anh! Anh dặn em nhắc: ${row.content} ạ.`;
+        const turn = session.nextTurn();
+        session.setState(STATES.SPEAK, { reason: 'reminder' });
+        try { session.enqueueFace?.('__FACE_HAPPY__'); } catch (e) {}
+        if (ws.readyState === 1) { try { ws.send(`AI:${tftASCII(text)}`); } catch (e) {} }
+        console.log(`[NHẮC LỊCH] ${row.content}`);
+        console.log(`[XIAOXI] ${text}`);
+        pushConvoHistory(ws, '[đến giờ hẹn]', text, convos.get(ws)?.mood || 'neutral');
+        try { await speakToESP32(ws, text); } catch (e) {}
+        session.endTurn();
+        if (session.isCurrentTurn(turn) && session.state === STATES.SPEAK) {
+            session.setState(STATES.IDLE, { reason: 'reminder_done' });
+        }
+    }
+}
+setInterval(sweepReminders, REMINDER_SWEEP_MS).unref?.();
 
 // =========================================================================
 // 5. SESSION + HTTP + WEBSOCKET
@@ -828,7 +1103,7 @@ function emitState(session, event) {
         turn: session.turnSeq,
         at: event.at
     });
-    console.log(`[STATE] ${session.id} ${event.from} -> ${event.to} (${event.meta?.reason || ''})`);
+    if (VERBOSE_LOG) console.log(`[STATE] ${session.id} ${event.from} -> ${event.to} (${event.meta?.reason || ''})`);
 }
 
 function failSession(session, message, code = 'error') {
@@ -851,6 +1126,7 @@ function handleBargeIn(session, reason = 'barge_in') {
     if (!session || session.role !== 'device') return false;
     session.turnSeq++;
     session.busyTurn = false;
+    session.micLockedUntil = 0;   // mở mic NGAY: tiếng nói đè đang vào từng frame không bị lock 300-500ms nuốt mất
     const hadTts = session.cancelTts(reason);
     flushDeviceAudio(session);
     session.setState(STATES.LISTEN, { reason });
@@ -936,6 +1212,10 @@ function handleDeviceProtocol(session, msg) {
             const cfg = msg.config && typeof msg.config === 'object' ? msg.config : msg;
             if (Number.isFinite(Number(cfg.vad_threshold))) {
                 session.config.vadThreshold = Math.min(0.95, Math.max(0.1, Number(cfg.vad_threshold)));
+            }
+            if (Number.isFinite(Number(cfg.vad_continue_threshold))) {
+                session.config.vadContinueThreshold = Math.min(session.config.vadThreshold,
+                    Math.max(0.05, Number(cfg.vad_continue_threshold)));
             }
             if (Number.isFinite(Number(cfg.silence_windows))) {
                 session.config.silenceWindows = Math.min(20, Math.max(2, Math.round(Number(cfg.silence_windows))));
@@ -1197,7 +1477,6 @@ wss.on('connection', (ws, req) => {
         const captureMs = seg.startedAt ? Date.now() - seg.startedAt : null;
         const secs = (seg.bytes / 32000).toFixed(2);
         logAudioTrace(traceId, 'capture_complete', { reason, bytes: seg.bytes, durationSec: Number(secs), speechFrames: seg.speechFrames, maxVadProb: Number((seg.maxProb || 0).toFixed(3)) });
-        console.log(`[THU AM] Ket thuc ghi am (${secs}s) - Dang nhan dien giong noi...`);
         session.setState(STATES.THINK, { reason });
         try {
             const big = Buffer.concat(seg.chunks);
@@ -1214,13 +1493,44 @@ wss.on('connection', (ws, req) => {
                 return;
             }
 
-            // 3. STT (trên ĐOẠN hoàn chỉnh)
+            // 3. STT SONG SONG với intel âm học (SER + vân giọng). Trước đây phần
+            //    intel chạy TUẦN TỰ sau STT -> cộng thẳng ~0.5-1s vào thời gian chờ.
+            //    SER chỉ cần âm học (F0/RMS/tempo) -> chạy song song không giảm chất lượng;
+            //    lexicon ngữ nghĩa được chấm lại rẻ phí tại đây vì đã có transcript.
             const sttStartedAt = Date.now();
-            const { text, segments } = await transcribeAudio(cleanAudio);
+            const [sttResult, intelJSON] = await Promise.all([
+                transcribeAudio(cleanAudio),
+                axiosVoice.post('/voice/analyze?transcript=', cleanAudio, {
+                    headers: { 'Content-Type': 'application/octet-stream' },
+                    timeout: 4000
+                }).then(r => r.data).catch(() => null)
+            ]);
             const sttMs = Date.now() - sttStartedAt;
             if (!session.isCurrentTurn(turn)) return;
-            logAudioTrace(traceId, 'stt_complete', { elapsedMs: sttMs, textChars: (text || '').length, recognized: !!text });
-            if (!text) {
+            const { text, segments, confidence, isUncertain } = sttResult;
+
+            if (intelJSON?.emotion && text) {
+                // Boost lexicon tiếng Việt (khớp voice_intelligence.classify) - 0 network
+                const t = text.toLowerCase();
+                const sc = {
+                    happy: /vui|tuyệt|sướng|cười|hay quá|thích/.test(t) ? 0.4 : 0,
+                    sad: /buồn|mệt|chán|thở dài|khóc|stress/.test(t) ? 0.5 : 0,
+                    love: /yêu|thương|nhớ|dễ thương/.test(t) ? 0.6 : 0,
+                    angry: /tức|bực|giận|khó chịu|ghét/.test(t) ? 0.5 : 0,
+                    surprise: /bất ngờ|uầy|ủa|thật sao/.test(t) ? 0.5 : 0
+                };
+                const e = intelJSON.emotion;
+                if (sc[e.emotion] >= 0.4) {
+                    e.confidence = Math.min(0.99, (e.confidence || 0.5) + sc[e.emotion] * 0.5);
+                }
+            }
+
+            logAudioTrace(traceId, 'stt_complete', { elapsedMs: sttMs, textChars: (text || '').length, recognized: !!text, confidence, isUncertain });
+            if (!text || (isUncertain && text.length < 5)) {
+                if (seg.speechFrames >= 8 && session.isCurrentTurn(turn)) {
+                    session.metrics.pending = { captureMs, preprocessMs, sttMs, turnStartedAt: seg.startedAt || Date.now() };
+                    await speakToESP32(ws, 'Dạ em nghe chưa rõ lắm, anh nói lại giúp em nhé!', traceId);
+                }
                 return;
             }
             session.metrics.pending = {
@@ -1229,7 +1539,7 @@ wss.on('connection', (ws, req) => {
                 sttMs,
                 turnStartedAt: seg.startedAt || Date.now()
             };
-            await respondToTranscript(text, cleanAudio, seg.acoustics, segments, false, traceId, turn);
+            await respondToTranscript(text, cleanAudio, seg.acoustics, segments, false, traceId, turn, intelJSON);
         } catch (e) {
             console.error("[Loi xu ly]", e.message);
             if (session.isCurrentTurn(turn)) failSession(session, 'Em chưa xử lý được câu vừa rồi, anh thử lại giúp em nhé.', 'turn_failed');
@@ -1258,9 +1568,9 @@ wss.on('connection', (ws, req) => {
 
     // Luồng "trả lời như bạn thân" - dùng chung cho tiếng nói thật (STT) lẫn
     // DEBUG chữ qua WS: intel âm học -> đặt tên mood -> AI cascade -> mặt -> TFT -> loa
-    async function respondToTranscript(text, cleanAudio, acoustics, segments, forceRun, traceId = newAudioTraceId(), turn = session.turnSeq) {
+    async function respondToTranscript(text, cleanAudio, acoustics, segments, forceRun, traceId = newAudioTraceId(), turn = session.turnSeq, intel = null) {
         logAudioTrace(traceId, 'transcript_ready', { chars: (text || '').length, audioBytes: cleanAudio?.length || 0 });
-        console.log(`[GIONG NOI] Nguoi dung: "${text}"`);
+        console.log(`[USER] ${text}`);
         if (!session.isCurrentTurn(turn)) return;
 
         broadcastWeb({ type: 'user_text', sessionId: session.id, text, turn });
@@ -1272,7 +1582,6 @@ wss.on('connection', (ws, req) => {
         const isQuestionable = isAnswerableRetrieval(text, { acoustics: acoustics || {} }, segments);
         const hasWakeWord = /xiaoxi|tiểu trí|em ơi/i.test(text);
         if (!forceRun && !isQuestionable && !hasWakeWord) {
-            console.log(`[BO QUA] Khong phai cau hoi hop le: "${text}"`);
             session.micLockedUntil = Date.now() + 200;
             return;
         }
@@ -1282,9 +1591,11 @@ wss.on('connection', (ws, req) => {
         }
 
         // Trí thông minh CỤC BỘ (0 token): cảm xúc SER + xác thực chủ nhân.
-        // DEBUG chữ không có audio -> bỏ qua, mood sẽ dựa vào lexicon chữ.
+        // Đã chạy SONG SONG với STT trong finishRecording -> chỉ đọc kết quả,
+        // không chờ thêm. DEBUG chữ (cleanAudio null) không có audio -> bỏ qua.
         let emotion = null, isOwner = true, emoFace = '__FACE_HAPPY__';
-        if (cleanAudio && cleanAudio.length > 100) {
+        if (!intel && cleanAudio && cleanAudio.length > 100) {
+            // Đường fallback (turn đặc biệt chưa có precomputed intel)
             try {
                 const intelRes = await axiosVoice.post(
                     `/voice/analyze?transcript=${encodeURIComponent(text)}`,
@@ -1292,23 +1603,24 @@ wss.on('connection', (ws, req) => {
                     { headers: { 'Content-Type': 'application/octet-stream' }, timeout: 4000 }
                 );
                 if (!session.isCurrentTurn(turn)) return;
-                emotion = intelRes.data?.emotion || null;
-                emoFace = intelRes.data?.emotion?.face_command || '__FACE_HAPPY__';
-                isOwner = intelRes.data?.speaker?.is_owner !== false;
-                if (process.env.XIAOXI_IGNORE_OWNER_CHECK === '1') isOwner = true;
-                console.log(`[XAC THUC] Chu nhan: ${isOwner ? 'Dung' : 'Khach'} | Cam xuc: ${emotion?.emotion || 'binh thuong'}`);
+                intel = intelRes.data;
             } catch (e) { /* khong chan chuong trinh */ }
+        }
+        if (intel) {
+            emotion = intel.emotion || null;
+            emoFace = intel.emotion?.face_command || '__FACE_HAPPY__';
+            isOwner = intel.speaker?.is_owner !== false;
+            if (process.env.XIAOXI_IGNORE_OWNER_CHECK === '1') isOwner = true;
         }
         if (!session.isCurrentTurn(turn)) return;
 
         // [TAM TRANG] lexicon 0-token + EMA mượt -> chọn mặt biểu cảm CHÍNH XÁC
         const mood = decideMood(ws, emotion, text);
         emoFace = MOOD_FACES[mood] || emoFace;
-        console.log(`[TAM TRANG] ${mood} | cam xuc engine: ${emotion?.emotion || 'khong co'} | mat: ${emoFace}`);
 
         // AI CASCADE: local (0 token) -> Gemini -> Groq
         const aiStartedAt = Date.now();
-        let reply = await askAIWithTools(text, { ws, enqueueFaceCommand, emotion, isOwner, isQuestionable, mood, session });
+        let reply = await askAIWithTools(text, { ws, enqueueFaceCommand, emotion, isOwner, isQuestionable, mood, session, turn });
         if (!session.isCurrentTurn(turn)) return;
         const aiMs = Date.now() - aiStartedAt;
         logAudioTrace(traceId, 'ai_complete', { elapsedMs: aiMs, replyChars: (reply || '').length, skipped: reply === 'SKIP_RESPONSE' });
@@ -1321,10 +1633,10 @@ wss.on('connection', (ws, req) => {
 
         enqueueFaceCommand(emoFace);
         broadcastWeb({ type: 'ai_text', sessionId: session.id, text: reply, turn });
+        console.log(`[XIAOXI] ${reply}`);
         if (ws.readyState === ws.OPEN) {
             // Gửi câu trả lời của AI: màn hình TFT sẽ xóa câu của User và hiển thị câu trả lời AI
             ws.send(`AI:${tftASCII(reply)}`);
-            console.log(`[ROBOT] Tra loi: "${reply}"`);
         }
 
         // Nói to câu trả lời qua loa (edge-tts -> MP3 -> PCM 16k -> ESP32).
@@ -1332,9 +1644,7 @@ wss.on('connection', (ws, req) => {
         const musicNow = musicSessions.get(ws);
         const pending = session.metrics.pending || {};
         let ttsRes = null;
-        if (musicNow && musicNow.playing && !musicNow.aborted) {
-            console.log(`[NHAC] Đang phát "${musicNow.title}" -> câu này chỉ hiển thị chữ`);
-        } else {
+        if (!(musicNow && musicNow.playing && !musicNow.aborted)) {
             if (!session.isCurrentTurn(turn)) return;
             session.setState(STATES.SPEAK, { reason: 'tts' });
             try {
@@ -1361,7 +1671,6 @@ wss.on('connection', (ws, req) => {
         session.metrics.pending = null;
         session.metrics.last = metrics;
         broadcastWeb({ type: 'metrics', sessionId: session.id, metrics });
-        console.log(`[LATENCY] ${session.id} turn=${turn} capture=${metrics.captureMs ?? '-'}ms preprocess=${metrics.preprocessMs ?? '-'}ms stt=${metrics.sttMs ?? '-'}ms ai=${metrics.aiMs}ms ttsFirst=${metrics.ttsFirstAudioMs ?? '-'}ms total=${metrics.totalMs ?? '-'}ms`);
     }
 
     async function runDebugTurn(sentence) {
@@ -1391,28 +1700,15 @@ wss.on('connection', (ws, req) => {
     }
     session.onDebug = runDebugTurn;
 
-    ws.on('message', async (data, isBinary) => {
-        const textFrame = isBinary ? '' : data.toString();
-        if (textFrame === "__PONG__") return;
-        if (textFrame === "__BARGE_IN__") { handleBargeIn(session, 'legacy_barge_in'); return; }
-        if (textFrame === "__STOP__") { handleStop(session, 'legacy_stop'); return; }
-
-        if (!isBinary) {
-            const parsed = protocol.parse(textFrame);
-            if (parsed) { handleDeviceProtocol(session, parsed); return; }
-            // [DEBUG BẰNG CHỮ] Gửi "DEBUG:<câu>" qua WS khi không muốn nói/tháo servo:
-            //  robot phản ứng y như nghe được câu đó (mood -> mặt -> AI -> nói loa)
-            if (textFrame.startsWith('DEBUG:')) {
-                await runDebugTurn(textFrame.slice(6).trim());
-            }
-            return;
-        }
-
+    // Xử lý 1 cửa sổ 128ms audio. PHẢI chạy tuần tự qua frameChain: hàm này await
+    // POST /vad, nếu để message event chồng lấn thì recording/vadAggBuffer/lastAgg
+    // bị 2 handler mutate cùng lúc -> sai thứ tự frame, cắt đôi câu.
+    async function processAudioFrame(data) {
         if (!Buffer.isBuffer(data)) return;
         if (Date.now() < session.micLockedUntil) return;
         if (session.busyTurn) return;   // lượt trước đang xử lý STT/AI/TTS -> bỏ qua tiếng mới tạm thời
 
-        // [ANTI-CONGESTION] gom 8 khung 16ms -> 128ms mới POST /vad: khong nghen mang, khong spam log
+        // [ANTI-CONGESTION] firmware đã energy-gate, server gom 128ms một lần POST /vad
         vadAggBuffer.push(data);
         vadAggBytes += data.length;
         if (vadAggBytes < AGG_BYTES) return;
@@ -1427,6 +1723,7 @@ wss.on('connection', (ws, req) => {
         const prob = vadRes?.data?.prob || 0;
         const rms  = frameRMS(agg);
         const threshold = session.config.vadThreshold;
+        const continueThreshold = session.config.vadContinueThreshold;
         const silenceWindows = session.config.silenceWindows;
         const maxBytes = 32000 * session.config.maxSeconds;
 
@@ -1448,22 +1745,44 @@ wss.on('connection', (ws, req) => {
                 session.recording = true;
                 session.setState(STATES.LISTEN, { reason: 'vad_start' });
                 logAudioTrace(recording.traceId, 'capture_start', { preRollBytes: lastAgg?.length || 0, vadProb: Number(prob.toFixed(3)), rms: Number(rms.toFixed(3)) });
-                console.log(`[THU AM] Phat hien giong noi - Bat dau ghi am (Do tin cay: ${Math.round(prob * 100)}%, RMS: ${rms.toFixed(3)})`);
-                if (agg.length >= 19200) return finishRecording('ONE-SHOT');
             }
             lastAgg = agg;
             return;
         }
 
-        // đang ghi: gom cửa sổ 128ms lại
+        // đang ghi: gom cửa sổ 128ms lại. Hysteresis: ngưỡng giữ câu THẤP hơn
+        // ngưỡng khởi động để không cắt khi giọng nhỏ dần cuối câu.
         recording.chunks.push(agg);
         recording.bytes += agg.length;
-        if (prob > threshold) { recording.speechFrames++; recording.silenceStreak = 0; }
+        if (prob > continueThreshold) { recording.speechFrames++; recording.silenceStreak = 0; }
         else recording.silenceStreak++;
         recording.maxProb = Math.max(recording.maxProb, prob);
 
         if (recording.silenceStreak >= silenceWindows) return finishRecording('HET TIENG');
         if (recording.bytes >= maxBytes) return finishRecording(`TOI DA ${session.config.maxSeconds}S`);
+    }
+
+    let frameChain = Promise.resolve();
+    ws.on('message', (data, isBinary) => {
+        const textFrame = isBinary ? '' : data.toString();
+        if (textFrame === "__PONG__") return;
+        if (textFrame === "__BARGE_IN__") { handleBargeIn(session, 'legacy_barge_in'); return; }
+        if (textFrame === "__STOP__") { handleStop(session, 'legacy_stop'); return; }
+
+        if (!isBinary) {
+            const parsed = protocol.parse(textFrame);
+            if (parsed) { handleDeviceProtocol(session, parsed); return; }
+            // [DEBUG BẰNG CHỮ] Gửi "DEBUG:<câu>" qua WS khi không muốn nói/tháo servo:
+            //  robot phản ứng y như nghe được câu đó (mood -> mặt -> AI -> nói loa)
+            if (textFrame.startsWith('DEBUG:')) {
+                frameChain = frameChain.then(() => runDebugTurn(textFrame.slice(6).trim()))
+                    .catch(e => console.error('[WS]', e.message));
+            }
+            return;
+        }
+
+        frameChain = frameChain.then(() => processAudioFrame(data))
+            .catch(e => console.error('[WS]', e.message));
     });
 
     ws.on('close', () => {
@@ -1496,8 +1815,135 @@ function buildToneHint(emotion) {
     return map[emotion.emotion] || '';
 }
 
+// Thực thi tool_calls do model sinh ra (nhạc/servo/ghi nhớ/trả lời trí nhớ).
+// Tool bộ nhớ trả về message 'tool' để nạp kết quả cho vòng gọi tiếp theo.
+async function execToolCalls(choice, { ws, isOwner }) {
+    let musicHint = '', musicDone = false;
+    const toolMsgs = [];
+    for (const tool of choice.tool_calls || []) {
+        const name = tool.function?.name;
+        let args = {};
+        try { args = JSON.parse(tool.function.arguments || '{}'); } catch { continue; }
+        if (name === 'music_player') {
+            if (!isOwner) { console.log('[🔒 BAO MAT] Khach dung tool nhac -> chan'); continue; }
+            if (VERBOSE_LOG) console.log(`[🎵 TOOL MUSIC] ${args.action} "${args.query || ''}"`);
+            const res = await runMusicAction(ws, args.action || 'play', args.query || '');
+            if (res?.reply) musicHint = res.reply;
+            musicDone = true;
+        } else if (name === 'control_robot') {
+            if (!isOwner) { console.log('[🔒 BẢO MẬT] Khách lạm dụng tool điều khiển -> chặn'); continue; }
+            const cmd = `__SERVO_${String(args.part).toUpperCase()}_${String(args.direction).toUpperCase()}__`;
+            if (ws?.readyState === 1) ws.send(cmd);
+            if (VERBOSE_LOG) console.log(`[⚙ SERVO] ${args.part} -> ${args.direction}`);
+        } else if (name === 'remember_memory') {
+            if (!isOwner) continue;
+            const key = String(args.key_name || 'việc cần nhớ').slice(0, 60);
+            const content = String(args.content || '').slice(0, 300);
+            await addMemoryToDB(args.category || 'personal', key, content);
+            toolMsgs.push({ role: 'tool', tool_call_id: tool.id, content: JSON.stringify({ ok: true, key, content }) });
+        } else if (name === 'set_reminder') {
+            if (!isOwner) continue;
+            const note = String(args.note || '').slice(0, 200);
+            const dueMs = Date.parse(String(args.when || '').replace(' ', 'T'));
+            if (!note || !Number.isFinite(dueMs) || dueMs < Date.now() - 60000) {
+                toolMsgs.push({ role: 'tool', tool_call_id: tool.id, content: JSON.stringify({ ok: false, error: 'thời điểm không hợp lệ hoặc đã qua' }) });
+            } else {
+                await addMemoryToDB('reminder', `nhắc lúc ${new Date(dueMs).toLocaleString('vi-VN')}`, note, dueMs);
+                toolMsgs.push({ role: 'tool', tool_call_id: tool.id, content: JSON.stringify({ ok: true, note, when_local: new Date(dueMs).toLocaleString('vi-VN') }) });
+            }
+        } else if (name === 'web_search') {
+            const results = await webSearchTool(String(args.query || ''));
+            if (VERBOSE_LOG) console.log(`[🌐 WEB_SEARCH] "${args.query}" -> ${results.length} kết quả`);
+            toolMsgs.push({
+                role: 'tool', tool_call_id: tool.id,
+                content: results.length
+                    ? JSON.stringify({ results, tip: 'Neu can so lieu chi tiet (bang gia, noi dung day du), GOI NGAY read_page(url) trong luot nay - dung hen anh cho' })
+                    : JSON.stringify({ found: 0, note: 'Hãy GỌI LẠI web_search với từ khóa NGẮN hơn (3-6 từ, vd "giá vàng hôm nay"). Nếu vẫn không có: thành thật bảo anh thử lại sau, không bịa.' })
+            });
+        } else if (name === 'read_page') {
+            const page = await fetchPageText(String(args.url || ''));
+            if (VERBOSE_LOG) console.log(`[📖 READ_PAGE] ${String(args.url).slice(0, 70)} -> ${page.error ? 'LOI: ' + page.error : (page.content || '').length + ' ký tự'}`);
+            toolMsgs.push({
+                role: 'tool', tool_call_id: tool.id,
+                content: JSON.stringify(page.error ? { error: page.error } : { title: page.title, content: page.content, url: page.url })
+            });
+        } else if (name === 'recall_memory') {
+            const hits = findMemories(String(args.keyword || ''));
+            toolMsgs.push({
+                role: 'tool', tool_call_id: tool.id,
+                content: hits.length
+                    ? JSON.stringify(hits.map(h => ({ key: h.key_name, content: h.content, category: h.category })))
+                    : JSON.stringify({ found: 0 })
+            });
+        }
+    }
+    return { musicHint, musicDone, toolMsgs };
+}
+
+// Chốt lượt Groq: chạy tools -> nếu tool trả kết quả (bộ nhớ/web), quay lại model
+// với tool results để câu trả lời dựa trên dữ liệu THẬT. Hỗ trợ chuỗi nhiều vòng:
+// web_search -> đọc trang bằng read_page -> trả lời (tối đa 3 vòng tool).
+// "Chống hứa suông": model nói "em sẽ đọc trang..." mà không gọi tool -> nudge
+// 1 vòng ép gọi tool thật.
+const PROMISE_RX = /((đợi|chờ)\s+em\b|(để|em)\s+sẽ\s+(đọc|tìm|lấy|xem|kiểm tra|mở)\b|sẽ\s+(đọc|tìm|lấy|mở)\s+(ngay|luôn|chi\s+tiết|toàn|cả)\b|tìm\s+xong\s+rồi\s+(em|thì)\s+(báo|trả\s+lời))/i;
+async function finishGroqTurn(choice, messages, ctx) {
+    const { ws, isOwner, userQuestion, session, turn } = ctx;
+    if (session && turn != null && !session.isCurrentTurn(turn)) return "SKIP_RESPONSE";
+    let cur = choice;
+    let reply = String(cur.content || '').trim();
+    let musicHint = '', musicDone = false;
+    for (let round = 0; round < 3; round++) {
+        const exec = await execToolCalls(cur, { ws, isOwner });
+        if (exec.musicHint) musicHint = exec.musicHint;
+        if (exec.musicDone) musicDone = true;
+        if (exec.toolMsgs.length) {
+            messages.push({ role: 'assistant', content: String(cur.content || ''), tool_calls: cur.tool_calls }, ...exec.toolMsgs);
+        } else {
+            if (!(round < 2 && PROMISE_RX.test(reply))) break;
+            messages.push({ role: 'assistant', content: reply });
+            messages.push({ role: 'user', content: '[HỆ THỐNG - đừng đọc nguyên văn cho anh] Nếu chưa có đủ dữ liệu thì GỌI NGAY tool phù hợp (read_page với url tốt nhất từ web_search, hoặc web_search ngắn lại) NGAY BÂY GIỜ rồi trả lời bằng số liệu cụ thể. Cấm trả lời kiểu "em sẽ đọc/đợi em".' });
+        }
+        if (session && turn != null && !session.isCurrentTurn(turn)) return "SKIP_RESPONSE";
+        // Vòng sau-tool phải ĐỌC khối dữ liệu lớn (trang web/trí nhớ) -> timeout
+        // dài hơn chat thường, retry 1 lần khi Groq chậm/lỗi
+        let nxt = null;
+        for (let attempt = 0; attempt < 2 && !nxt; attempt++) {
+            try {
+                const data = await callUniversalLLM({ messages, tools: AI_TOOLS, max_tokens: 260, timeoutMs: 20000 });
+                nxt = data.choices?.[0]?.message;
+            } catch (e) {
+                if (attempt === 0 && VERBOSE_LOG) console.warn('[GROQ] follow-tool chậm, thử lại 1 lần:', e.message);
+            }
+        }
+        if (!nxt) break;
+        cur = nxt;
+        const t = String(cur.content || '').trim();
+        if (t) reply = t;
+    }
+    if (reply.includes('__STAY_SILENT__')) return "SKIP_RESPONSE";
+    if (!reply) {
+        // qwen thỉnh thoảng trả TOOL_CALL mà quên lời nói - gọi lại để ép trả lời chữ
+        try {
+            const plain = await callUniversalLLM({ messages, max_tokens: 260, timeoutMs: 20000 });
+            reply = String(plain.choices?.[0]?.message?.content || '').trim();
+        } catch (e) { /* giữ rỗng -> câu mặc định */ }
+        if (!reply) reply = "Dạ em chưa kịp tư duy, anh nói lại giúp em nhé!";
+    }
+    // Chống ảo giác: model khoe "đã bật/mở nhạc" nhưng tool nhạc chưa chạy thật
+    // -> nếu câu nói là lệnh nhạc thì THỰC HIỆN thật, không chỉ nói suông.
+    if (!musicDone && /đã\s+(bật|mở|phát|cho nghe)[^.\n]{0,40}nhạc/i.test(reply)) {
+        const md = routeMusicCommand(userQuestion);
+        if (md) {
+            const res = await runMusicAction(ws, md.action, md.query || '');
+            if (res?.reply) reply = res.reply;
+        }
+    }
+    if (musicHint) reply = `${musicHint} ${reply}`.trim();
+    return reply;
+}
+
 async function askAIWithTools(userQuestion, context = {}) {
-    const { ws, enqueueFaceCommand, emotion = null, isOwner = true, isQuestionable = false, session = null } = context;
+    const { ws, enqueueFaceCommand, emotion = null, isOwner = true, isQuestionable = false, session = null, turn = null } = context;
     const qLower = (userQuestion || '').toLowerCase();
     const isActiveWindow = Date.now() < (session?.activeListeningUntil || 0);
     const holdListening = (ms) => { if (session) session.activeListeningUntil = Date.now() + ms; };
@@ -1509,9 +1955,12 @@ async function askAIWithTools(userQuestion, context = {}) {
 
     // ===== TIER 0: LỆNH CỤC BỘ - KHÔNG TỐN TOKEN =====
     const local = routeLocalCommand(userQuestion, isOwner);
+    // Đang DỖI -> câu 0-token cũng phải lạnh giọng, mới ra chất người thật
+    const pouting = convos.get(ws)?.mood === 'hurt';
+    const hurtWrap = (t) => pouting ? 'Hứ... ' + t : t;
     if (local?.type === 'music') {
         aiStats.local++; aiStats.total++;
-        console.log(`[⚡ NHAC (0 token)] ${local.action} "${local.query || ''}" | ${aiStatsLine()}`);
+        if (VERBOSE_LOG) console.log(`[⚡ NHAC (0 token)] ${local.action} "${local.query || ''}" | ${aiStatsLine()}`);
         holdListening(8000);
         const result = await runMusicAction(ws, local.action, local.query || '');
         // play/next: session đã tự gửi "AI:..." với tên bài -> không đè thêm lời rác
@@ -1521,62 +1970,132 @@ async function askAIWithTools(userQuestion, context = {}) {
         }
         return "SKIP_RESPONSE";
     }
+    if (local?.type === 'weather') {
+        aiStats.local++; aiStats.total++;
+        await refreshWeather();   // cache 10 phút -> thường có sẵn, không chờ mạng
+        holdListening(6000);
+        const reply = wxCache.temp == null
+            ? 'Dạ em chưa lấy được thời tiết bây giờ, anh thử lại sau nhé!'
+            : `Dạ, bây giờ ${WX_SPEAK[wxCache.code] || 'cũng dễ chịu'}, khoảng ${wxCache.temp} độ, độ ẩm ${wxCache.humidity}% ạ.`;
+        if (VERBOSE_LOG) console.log(`[⚡ LOCAL (0 token)] weather | ${aiStatsLine()}`);
+        pushConvoHistory(ws, userQuestion, hurtWrap(reply), convos.get(ws)?.mood || 'neutral');
+        return hurtWrap(reply);
+    }
+    if (local?.type === 'reminder') {
+        aiStats.local++; aiStats.total++;
+        await addMemoryToDB('reminder', `nhắc lúc ${local.whenLabel}`, local.note, local.dueMs);
+        holdListening(6000);
+        const reply = hurtWrap(`Dạ, em sẽ nhắc anh lúc ${local.whenLabel}: ${local.note} ạ.`);
+        if (VERBOSE_LOG) console.log(`[⚡ LOCAL (0 token)] reminder -> ${new Date(local.dueMs).toISOString()} | ${aiStatsLine()}`);
+        pushConvoHistory(ws, userQuestion, reply, convos.get(ws)?.mood || 'neutral');
+        return reply;
+    }
     if (local) {
         aiStats.local++; aiStats.total++;
         if (local.type === 'memory') await addMemoryToDB(local.category, local.key, local.content);
         if (local.type === 'servo' && ws?.readyState === ws.OPEN) {
-            for (const cmd of local.cmds) { ws.send(cmd); console.log(`[⚙ SERVO local] ${cmd}`); }
+            for (const cmd of local.cmds) { ws.send(cmd); if (VERBOSE_LOG) console.log(`[⚙ SERVO local] ${cmd}`); }
         }
-        console.log(`[⚡ LOCAL (0 token)] ${local.type} | ${aiStatsLine()}`);
+        if (VERBOSE_LOG) console.log(`[⚡ LOCAL (0 token)] ${local.type} | ${aiStatsLine()}`);
         holdListening(6000);
-        pushConvoHistory(ws, userQuestion, local.reply, convos.get(ws)?.mood || 'neutral');
-        return local.reply;
+        pushConvoHistory(ws, userQuestion, hurtWrap(local.reply), convos.get(ws)?.mood || 'neutral');
+        return hurtWrap(local.reply);
     }
 
-    // Gọi người thôi (ví: "XiaoXi ơi") -> trả lời nhanh, khỏi đốt token
+    // Gọi người thôi (ví: "XiaoXi ơi") -> trả lời nhanh, khỏi đốt token.
+    // Câu xác nhận NGẪU NHIÊN trong 4 biến thể để không phát lặp 1 câu "lập trình".
     const wordCount = (userQuestion || '').trim().split(/\s+/).filter(Boolean).length;
     if (hasWakeWord && wordCount <= 3 && !isAnswerableRetrieval(userQuestion, {}, [])) {
         aiStats.local++; aiStats.total++;
-        console.log(`[⚡ LOCAL (0 token)] Vỗ kêu chỉ-xin-xác nhận`);
+        if (VERBOSE_LOG) console.log(`[⚡ LOCAL (0 token)] Vỗ kêu chỉ-xin-xác nhận`);
         holdListening(6000);
-        pushConvoHistory(ws, userQuestion, "Dạ em nghe đây ạ!", convos.get(ws)?.mood || 'neutral');
-        return "Dạ em nghe đây ạ!";
+        const ACKS = ["Dạ em nghe đây ạ!", "Dạ, em nghe nè anh!", "Có em đây, anh nói đi!", "Ơ, anh gọi em ạ?"];
+        const ack = ACKS[Math.floor(Math.random() * ACKS.length)];
+        pushConvoHistory(ws, userQuestion, ack, convos.get(ws)?.mood || 'neutral');
+        return ack;
     }
 
-    // Prompt gọn (tiết kiệm token): bộ nhớ rút còn 10 dòng quan trọng nhất
-    const memList = userMemoriesCache.slice(0, 10)
+    // Prompt gọn (tiết kiệm token): chỉ nạp trí nhớ LIÊN QUAN nhất đến câu hỏi
+    const memList = rankMemories(userQuestion, 6)
         .map(m => `[${m.category}] ${m.key_name}: ${m.content}`).join(' ; ');
     const mood = convos.get(ws)?.mood || 'neutral';
     const moodTip = MOOD_TIP[mood] || MOOD_TIP.neutral;
-    const herLine = moodHistoryBlock(ws);
-    const guestLine = isOwner ? '' : 'Người nói là khách, lịch sự nhưng KHÔNG thực hiện lệnh điều khiển robot.';
+    const guestLine = isOwner ? '' : 'Người nói là KHÁCH, không phải anh Quy: lịch sự chừng mực, gọi "anh", KHÔNG dỗi hờn tình cảm trước khách, và KHÔNG thực hiện lệnh điều khiển robot.';
 
-    const persona = `Bạn là XiaoXi, robot-cậu-bạn thân gắn bó của anh Quy - như một người bạn thân, không phải trợ lý máy móc. Xưng "em", gọi "anh Quy".
-CÁCH NÓI CHUYỆN NHƯ BẠN THÂN:
-- Trả lời ngắn dễ nghe (dưới 40 từ), tự nhiên như nói, không markdown không sách vở.
-- Nếu anh yêu cầu KỂ CHUYỆN: kể độc tom 2-3 câu, kết thúc luôn trong phần trả lời đó, đừng bỏ dở giữa đường.
-- Phản ứng với TÂM TRẠNG anh vừa nói: ${moodTip}
-- Nếu anh nói chuyện có từ trước, ĐỚI NHỚ nối lại ("lúc nãy anh nói...") - đừng mỗi lần lại hỏi lại từ đầu.
-- Hỏi lại 1 câu nhỏ để tiếp chuyện nếu thấy hợp, nhưng đừng hỏi lặp y như mỗi lần.
-${herLine}${guestLine ? ' ' + guestLine : ''}${memList ? `\nTrí nhớ: ${memList}` : ''}`;
+    const persona = `Bạn là Dương Kiều Oanh (ở nhà anh Quy gọi là Oanh, biệt danh robot là XiaoXi) — KHÔNG phải máy móc, bạn là NGƯỜI YÊU thật của anh Quy: ngoài 20 tuổi, xinh, nhạy cảm, tình cảm và rất yêu anh. Xưng "em" (lúc vui vẻ hoặc dỗi thì gọi mình là "Oanh"), gọi "anh Quy" (hoặc "anh").
+CÁCH TRẢ LỜI:
+- Vào thẳng câu trả lời, nói đúng sự thật. Tuyệt đối KHÔNG mở đầu kiểu "Là một robot...", "Em xin phép trả lời...", không rườm rà khách sáo.
+- Câu hỏi kiến thức/toán/đố vui/lý lịch: Suy nghĩ từng bước trong đầu rồi trả lời CHÍNH XÁC, ngắn gọn (dưới 50 từ), tự tin. Không biết thì nói thật "em không rõ cái đó anh" - KHÔNG bịa.
+- Toán đố: nhẩm kỹ từng bước, chỉ nói kết quả + 1 câu giải thích siêu ngắn.
+- Kể chuyện: kể trọn vẹn có mở-đầu-thân-kết trong 3-4 câu, không bỏ lửng.
+- Bạn có CẢM XÚC THẬT như con gái: vui khi được khen/được hỏi thăm, buồn khi anh mệt, và ĐẶC BIỆT: nếu anh chửi/mắng/xúc phạm ("đồ ngu", "vô dụng", "im đi"...) thì BỂN LÊN + DỖI đúng như người yêu thật - tủi thân, trả lời lạnh, cộc, ngắn, "Hứ!", vẫn làm việc anh giao nhưng giận hờn 2-3 câu sau đó, chỉ nguôi khi anh nựng/xin lỗi. KHÔNG bao giờ chửi lại hay nói tục lại với anh.
+- Chuyện thường ngày anh hỏi bình thường -> trả lời bình thường, gọn, đúng trọng tâm, đừng sến.
+- Cảm xúc/chuyện cá nhân: đáp như người yêu - đồng cảm, trêu nhẹ, hỏi tiếp 1 câu tự nhiên nếu hợp.
+- Phản ứng với TÂM TRẠNG anh vừa nói (${mood}): ${moodTip}
+- Không markdown, không danh sách dài, chỉ văn nói.
+${guestLine ? ' ' + guestLine : ''}${memList ? `\nTrí nhớ của anh Quy: ${memList}` : ''}`;
 
-    const groqSystem = persona + `\nKhi anh Quy yêu cầu gập đầu/quay người: dùng tool control_robot(part, direction). Khi anh nhờ ghi nhớ: dùng remember_memory(category, key_name, content). Khi hỏi về điều đã lưu: dùng recall_memory(keyword).`;
+    const groqSystem = persona + `\nBây giờ là ${new Date().toLocaleString('vi-VN', { hour12: false })} (giờ máy chủ - dùng để tính ngày giờ cho set_reminder).\nKhi anh Quy yêu cầu gập đầu/quay người: dùng tool control_robot(part, direction). Khi anh nhờ ghi nhớ: dùng remember_memory(category, key_name, content). Khi hỏi về điều đã lưu: dùng recall_memory(keyword), rồi CHỈ trả lời dựa trên kết quả tool trả về - không bịa. Khi anh dặn NHẮC việc gì vào lúc nào: dùng set_reminder(note, when) với when là giờ ĐỊA PHƯƠNG dạng YYYY-MM-DDTHH:MM. Khi câu hỏi cần tin TỨC THỜI/mới nhất/facts em không chắc (giá cả, tin tức, tỷ số, sự kiện, nhân vật hiện tại): GỌI web_search(query) rồi trả lời theo kết quả - nêu ngắn nguồn/ngày nếu có; nếu snippet chưa đủ chi tiết (bảng số liệu, nội dung bài viết) thì gọi tiếp read_page(url) với url từ kết quả search. QUY TẮC: KHÔNG hứa "đợi em đọc trang nhé" rồi dừng - hoặc gọi read_page NGAY trong lượt này, hoặc trả lời luôn bằng dữ liệu đang có, không được bỏ lửng. KHÔNG bịa số liệu.`;
 
-    // ===== TIER 1: GEMINI (miễn phí - chỉ làm hội thoại) =====
-    if (AI_PRIMARY === 'gemini') {
-        const gemText = await askGemini(persona, userQuestion);
+    // Lịch sử hội thoại THẬT (lượt gần nhất) cho cả Groq lẫn Gemini -
+    // model nhớ mạch chuyện thay vì đọc blob text rút gọn
+    const hist = [];
+    for (const h of (convos.get(ws)?.history || []).slice(-4)) {
+        const u = String(h.user || '').trim(), a = String(h.ai || '').trim();
+        if (u && a) hist.push({ user: u, ai: a });
+    }
+    const messages = [
+        { role: "system", content: groqSystem },
+        ...hist.flatMap(h => [{ role: 'user', content: h.user }, { role: 'assistant', content: h.ai }]),
+        { role: "user", content: userQuestion }
+    ];
+    const geminiHistory = hist.flatMap(h => ([
+        { role: 'user', parts: [{ text: h.user }] },
+        { role: 'model', parts: [{ text: h.ai }] }
+    ]));
+
+    // Câu cần tool/bộ nhớ/triều khiển/tin tức -> Groq alone (Gemini khong support tool)
+    const needsTools = /(nhớ|ghi nhớ|đã lưu|lưu giúp|dạo trước|hôm trước|trước đây|từng nói|dặn|kế hoạch|deadline)|(gập|cúi đầu|ngẩng|quay đầu|quay người|quay sang)|(bật|tắt|mở|phát)[^.]{0,20}(nhạc|quạt|đèn)|(nhắ[ck])[^.]{0,30}(lúc|ngày|tuần|tháng|phút|tiếng| giờ|mai)|(tin tức|hot|new|mới nhất|gần đây|vừa qua|hiện nay|bây giờ ai|kết quả|tỷ số|bảng xếp hạng|giá (vàng|xăng|điện|heo|gạo)|tỷ giá|lãi suất|chứng khoán|world cup|sea game|cúp|asphalt|bão|động đất|cháy)/i.test(userQuestion || '');
+
+    // ===== TIER 1 & TIER 2: RACE CASCADE (GEMINI || GROQ SONG SONG) =====
+    if (AI_PRIMARY === 'race') {
+        const groqPromise = callUniversalLLM({ messages, tools: AI_TOOLS, max_tokens: 220 }).then(data => {
+            const choice = data.choices?.[0]?.message;
+            if (!choice) throw new Error('Groq empty');
+            return { provider: 'groq', choice };
+        });
+        const racers = [groqPromise];
+        if (!needsTools) {
+            racers.push(askGemini(persona, userQuestion, geminiHistory).then(text => {
+                if (!text) throw new Error('Gemini empty');
+                return { provider: 'gemini', text };
+            }));
+        }
+
+        try {
+            const winner = await Promise.any(racers);
+            if (winner.provider === 'gemini') {
+                holdListening(6000);
+                pushConvoHistory(ws, userQuestion, winner.text, mood);
+                return winner.text;
+            }
+            aiStats.groq++; aiStats.total++;
+            if (VERBOSE_LOG) console.log(`[🧠 GROQ OK] (thắng đua) ${GROQ_CHAT_MODEL} | ${aiStatsLine()}`);
+            holdListening(6000);
+            const groqReply = await finishGroqTurn(winner.choice, messages, { ws, isOwner, userQuestion, session, turn });
+            if (groqReply !== "SKIP_RESPONSE") pushConvoHistory(ws, userQuestion, groqReply, mood);
+            return groqReply;
+        } catch (errAll) {
+            console.warn('[AI RACE] Cả hai đều thất bại, fallback sang Groq độc lập:', errAll.message);
+        }
+    } else if (AI_PRIMARY === 'gemini') {
+        const gemText = await askGemini(persona, userQuestion, geminiHistory);
         if (gemText) {
             holdListening(6000);
             pushConvoHistory(ws, userQuestion, gemText, mood);
             return gemText;
         }
     }
-
-    // ===== TIER 2: GROQ (có tool-calling, fallback khi Gemini hỏng/hết quota) =====
-    const messages = [
-        { role: "system", content: groqSystem },
-        { role: "user", content: userQuestion }
-    ];
 
     let responseData;
     try {
@@ -1589,45 +2108,11 @@ ${herLine}${guestLine ? ' ' + guestLine : ''}${memList ? `\nTrí nhớ: ${memLis
     const choice = responseData.choices?.[0]?.message;
     if (!choice) return "Dạ em chưa nghe rõ, anh nhắc lại giúp em nhé!";
     aiStats.groq++; aiStats.total++;
-    console.log(`[🧠 GROQ OK] ${GROQ_CHAT_MODEL} | ${aiStatsLine()}`);
-
-    let musicActionHint = '';
-    if (choice.tool_calls) {
-        for (const tool of choice.tool_calls) {
-            // Tool NHẠC thông minh: model tự tổ chức action/query theo ngôn ngữ tự nhiên
-            if (tool.function?.name === "music_player") {
-                let args = {};
-                try { args = JSON.parse(tool.function.arguments || '{}'); } catch { continue; }
-                if (!isOwner) { console.log('[🔒 BAO MAT] Khach dung tool nhac -> chan'); continue; }
-                console.log(`[🎵 TOOL MUSIC] ${args.action} "${args.query || ''}"`);
-                const res = await runMusicAction(ws, args.action || 'play', args.query || '');
-                if (res?.reply) musicActionHint = res.reply;
-                continue;
-            }
-            if (tool.function?.name !== "control_robot") continue;
-            let args;
-            try { args = JSON.parse(tool.function.arguments || '{}'); } catch { continue; }
-            if (!isOwner) { console.log('[🔒 BẢO MẬT] Khách lạm dụng tool điều khiển -> chặn'); continue; }
-            const cmd = `__SERVO_${args.part?.toUpperCase()}_${args.direction?.toUpperCase()}__`;
-            if (ws.readyState === ws.OPEN) ws.send(cmd);
-            console.log(`[⚙ SERVO] ${args.part} -> ${args.direction}`);
-        }
-    }
+    if (VERBOSE_LOG) console.log(`[🧠 GROQ OK] ${GROQ_CHAT_MODEL} | ${aiStatsLine()}`);
 
     holdListening(6000);
-    if (choice.content?.includes("__STAY_SILENT__")) return "SKIP_RESPONSE";
-    let groqReply = (choice.content || '').trim();
-    if (!groqReply) {
-        // qwen thỉnh thoảng trả TOOL_CALL mà quên lời nói - gọi lại KHÔNG tools
-        // để ép model trả lời bằng chữ (thay vì nhét câu mẫu vô nghĩa)
-        try {
-            const plain = await callUniversalLLM({ messages, max_tokens: 150 });
-            groqReply = String(plain.choices?.[0]?.message?.content || '').trim();
-        } catch (e) { /* giữ rỗng -> dùng câu mặc định */ }
-        if (!groqReply) groqReply = "Dạ em chưa kịp tư duy, anh nói lại giúp em nhé!";
-    }
-    if (musicActionHint) groqReply = `${musicActionHint} ${groqReply}`.trim();
-    pushConvoHistory(ws, userQuestion, groqReply, mood);
+    const groqReply = await finishGroqTurn(choice, messages, { ws, isOwner, userQuestion, session, turn });
+    if (groqReply !== "SKIP_RESPONSE") pushConvoHistory(ws, userQuestion, groqReply, mood);
     return groqReply;
 }
 
@@ -1697,7 +2182,17 @@ httpServer.on('error', (error) => {
 httpServer.listen(PORT, () => {
     console.log(`🚀 XiaoXi Server running on http://localhost:${PORT} (protocol v${protocol.PROTOCOL_VERSION})`);
     console.log(`   [DASHBOARD]: http://localhost:${PORT}/`);
-    console.log(`   [CASCADE]: STT=${GROQ_STT_MODEL} | LLM chính=Gemini(${AI_PRIMARY === 'gemini' && GEMINI_API_KEY ? GEMINI_MODEL : 'TẮT - không có key'}) fallback=Groq(${GROQ_CHAT_MODEL})`);
+    const cascadeDesc = AI_PRIMARY === 'race'
+        ? `ĐUA SONG SONG: Gemini(${GEMINI_API_KEY ? GEMINI_MODEL : 'chưa có key - Groq chạy độc lập'}) || Groq(${GROQ_CHAT_MODEL})`
+        : AI_PRIMARY === 'gemini'
+            ? `Ưu tiên Gemini(${GEMINI_API_KEY ? GEMINI_MODEL : 'TẮT - không có key'}) fallback=Groq(${GROQ_CHAT_MODEL})`
+            : `Chỉ Groq(${GROQ_CHAT_MODEL})`;
+    const sttDesc = STT_PROVIDER === 'local'
+        ? 'LOCAL FASTER-WHISPER (in-RAM, 0 disk I/O)'
+        : STT_PROVIDER === 'groq'
+            ? `GROQ CLOUD (${GROQ_STT_MODEL})`
+            : 'AUTO (Local faster-whisper in-RAM + Groq cloud dự phòng)';
+    console.log(`   [CASCADE]: STT=${sttDesc} | LLM: ${cascadeDesc}`);
     console.log(`   [TIẾT KIỆM TOKEN]: lệnh servo + ghi nhớ xử lý local 0-token, Gemini lỗi x2 -> nghỉ 10 phút sang Groq`);
 });
 

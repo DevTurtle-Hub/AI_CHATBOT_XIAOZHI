@@ -30,6 +30,7 @@ from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.responses import Response
 import edge_tts
 import asyncio
+from contextlib import asynccontextmanager
 
 from voice_intelligence import (
     AudioPreprocessor,
@@ -114,8 +115,9 @@ vad_engine = SileroVAD(VAD_MODEL_PATH)
 # 2. DSP TIỀN XỬ LÝ CHO STT (High-pass + Denoise + AGC + Trim Silence)
 # =============================================================================
 def trim_silence_by_energy(pcm_bytes: bytes, sample_rate: int = 16000,
-                           top_db: float = 25.0, min_gap_ms: int = 150) -> bytes:
-    """Cắt khoảng lặng đầu/cuối dựa trên năng lượng RMS per-frame."""
+                           top_db: float = 35.0, min_gap_ms: int = 150) -> bytes:
+    """Cắt khoảng lặng đầu/cuối dựa trên năng lượng RMS per-frame.
+    top_db=35.0 + pre-roll 250ms bảo toàn 100% phụ âm gió nhẹ đầu câu (s, x, ph, th)."""
     if len(pcm_bytes) % 2 != 0:
         pcm_bytes = pcm_bytes[:-1]
     samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
@@ -141,29 +143,161 @@ def trim_silence_by_energy(pcm_bytes: bytes, sample_rate: int = 16000,
 
     first = int(np.argmax(voiced))
     last = int(n_frames - 1 - np.argmax(voiced[::-1]))
-    start = max(0, int(first * hop_len - 0.1 * sample_rate))
-    end = min(samples.size, int(last * hop_len + frame_len + 0.2 * sample_rate))
+    # Pre-roll 250ms (thay vì 100ms) để không bao giờ cắt mất âm đầu câu (XiaoXi, Phát nhạc, Bật đèn)
+    start = max(0, int(first * hop_len - 0.25 * sample_rate))
+    # Post-roll 300ms giữ trọn vẹn âm đuôi và ngữ điệu câu hỏi
+    end = min(samples.size, int(last * hop_len + frame_len + 0.30 * sample_rate))
     trimmed = samples[start:end]
     return np.clip(trimmed, -32768, 32767).astype(np.int16).tobytes()
 
 
 def preprocess_for_stt(pcm_bytes: bytes) -> bytes:
-    """Pipeline chuẩn hoá cho Whisper: HP 110Hz -> Spectral denoise -> AGC -> Trim."""
+    """Pipeline chuẩn hoá cho Whisper: HP 110Hz -> Trim lặng (giảm input denoise) -> Spectral denoise -> Far-field AGC."""
     out = AudioPreprocessor.highpass_filter(pcm_bytes, cutoff=110.0, sample_rate=SAMPLE_RATE)
+    out = trim_silence_by_energy(out, SAMPLE_RATE, top_db=35.0)
     out = AudioPreprocessor.spectral_noise_reduction(out, sample_rate=SAMPLE_RATE)
     out = AudioPreprocessor.farfield_adaptive_gain(out)
-    out = trim_silence_by_energy(out, SAMPLE_RATE, top_db=25.0)
     return out
 
 # =============================================================================
-# 3. SINGLETON HỒ SƠ VÂN GIỌNG
+# 3. SINGLETON HỒ SƠ VÂN GIỌNG & FASTER-WHISPER STT (IN-MEMORY)
 # =============================================================================
 speaker_vault = SpeakerVoiceprint(VOICEPRINT_PATH)
+
+
+DEFAULT_INITIAL_PROMPT = (
+    "Đây là hội thoại bằng tiếng Việt với robot trợ lý thông minh tên là XiaoXi. "
+    "Người dùng đưa khẩu lệnh điều khiển thiết bị, cử chỉ robot hoặc hỏi đáp thông tin. "
+    "Các từ khóa và khẩu lệnh thường dùng: XiaoXi ơi, em ơi, bật đèn, tắt đèn, bật quạt, tắt quạt, "
+    "mở nhạc, tắt nhạc, phát nhạc, gập đầu, cúi đầu, ngẩng đầu lên, nhìn thẳng, quay trái, quay phải, "
+    "thời tiết hôm nay thế nào, mấy giờ rồi, ghi nhớ giúp anh, nhắc anh, kể chuyện, hôm nay vui quá, tạm biệt."
+)
+
+
+class WhisperSTT:
+    def __init__(self, model_size: str = "base", language: str = "vi",
+                 device: str = "cpu", compute_type: str = "int8"):
+        self.language = language
+        self.model_size = model_size
+        self.model = None
+        try:
+            from faster_whisper import WhisperModel
+            print(f"[STT] Đang khởi tạo faster-whisper '{model_size}' ({device}, {compute_type})...")
+            self.model = WhisperModel(model_size, device=device, compute_type=compute_type, cpu_threads=4)
+            print(f"[STT] faster-whisper '{model_size}' sẵn sàng trong RAM (0 disk I/O)!")
+        except Exception as e:
+            print(f"[STT] Cảnh báo: Không thể nạp faster-whisper: {e}")
+
+    def warmup(self):
+        if not self.model:
+            return
+        try:
+            dummy = np.zeros(16000, dtype=np.float32)
+            list(self.model.transcribe(dummy, language=self.language, beam_size=1, without_timestamps=True, initial_prompt=DEFAULT_INITIAL_PROMPT)[0])
+            print("[STT WARM] faster-whisper đã làm ấm đồ thị tính toán!")
+        except Exception as e:
+            print(f"[STT WARM] Lỗi warm-up faster-whisper: {e}")
+
+    def transcribe_pcm(self, pcm_bytes: bytes, initial_prompt: str = "") -> dict:
+        if not self.model:
+            raise RuntimeError("Whisper model chưa được khởi tạo")
+        if len(pcm_bytes) % 2 != 0:
+            pcm_bytes = pcm_bytes[:-1]
+        if len(pcm_bytes) < 3200:
+            return {"text": "", "segments": [], "language": self.language, "duration": 0.0, "confidence": 1.0, "is_uncertain": False}
+
+        audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+        prompt = initial_prompt or DEFAULT_INITIAL_PROMPT
+
+        segments, info = self.model.transcribe(
+            audio,
+            language=self.language,
+            task="transcribe",
+            beam_size=1,
+            temperature=0.0,
+            repetition_penalty=1.2,
+            without_timestamps=True,
+            vad_filter=False,
+            initial_prompt=prompt,
+            condition_on_previous_text=False
+        )
+
+        seg_list = []
+        texts = []
+        conf_list = []
+
+        for s in segments:
+            t = s.text.strip()
+            if t:
+                texts.append(t)
+            prob = float(np.exp(np.clip(s.avg_logprob, -10.0, 0.0)))
+            conf_list.append(prob)
+            seg_list.append({
+                "id": getattr(s, "id", 0),
+                "start": getattr(s, "start", 0.0),
+                "end": getattr(s, "end", 0.0),
+                "text": t,
+                "avg_logprob": float(getattr(s, "avg_logprob", 0.0)),
+                "no_speech_prob": float(getattr(s, "no_speech_prob", 0.0)),
+                "confidence": round(prob, 3),
+            })
+
+        full_text = " ".join(texts).strip()
+        avg_confidence = float(np.mean(conf_list)) if conf_list else 1.0
+
+        # Lọc kết quả không chắc chắn / mơ hồ (lúng búng hoặc tạp âm ngẫu nhiên)
+        is_uncertain = False
+        if full_text:
+            first_no_speech = seg_list[0]["no_speech_prob"] if seg_list else 0.0
+            first_logprob = seg_list[0]["avg_logprob"] if seg_list else 0.0
+            if avg_confidence < 0.40 or first_no_speech > 0.65 or first_logprob < -2.8:
+                is_uncertain = True
+
+        return {
+            "text": full_text,
+            "segments": seg_list,
+            "language": info.language if info else self.language,
+            "duration": float(info.duration) if info else float(len(audio) / SAMPLE_RATE),
+            "confidence": round(avg_confidence, 3),
+            "is_uncertain": is_uncertain,
+        }
+
+
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "base")
+whisper_stt = WhisperSTT(model_size=WHISPER_MODEL_NAME, language="vi")
 
 # =============================================================================
 # 4. FASTAPI APP
 # =============================================================================
-app = FastAPI(title="XiaoXi Voice Engine", version="2.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Làm ấm kênh edge-tts & faster-whisper ngay khi engine vừa lên (DNS/TLS/token/graph) ->
+    các tác vụ STT và TTS đầu tiên phản hồi tức thì mà không bị lag kết nối lạnh."""
+    # 1. Warm-up faster-whisper trước khi mở nhận request (chống lag ở turn đầu tiên)
+    if whisper_stt:
+        await asyncio.to_thread(whisper_stt.warmup)
+
+    async def _warm_tts():
+        for i in range(3):
+            try:
+                t0 = asyncio.get_event_loop().time()
+                c = edge_tts.Communicate("Dạ", "vi-VN-HoaiMyNeural", rate="+18%")
+                async for chunk in c.stream():
+                    if chunk["type"] == "audio":
+                        break
+                ms = (asyncio.get_event_loop().time() - t0) * 1000
+                print(f"[TTS WARM] edge-tts sẵn sàng ({ms:.0f}ms) - kênh đã nóng")
+                break
+            except Exception as e:
+                print(f"[TTS WARM] Lần {i + 1} lỗi: {e} -> thử lại")
+                await asyncio.sleep(1.5)
+
+    asyncio.create_task(_warm_tts())
+    yield
+
+
+app = FastAPI(title="XiaoXi Voice Engine", version="2.0", lifespan=lifespan)
 
 
 async def read_pcm_body(request: Request) -> bytes:
@@ -180,6 +314,8 @@ async def health():
         "status": "ok",
         "sample_rate": SAMPLE_RATE,
         "vad_loaded": vad_engine is not None,
+        "whisper_loaded": whisper_stt is not None and whisper_stt.model is not None,
+        "whisper_model": whisper_stt.model_size if whisper_stt else None,
         "voiceprint_samples": len(speaker_vault.owner_profile.get("samples", [])) if speaker_vault.owner_profile else 0,
         "owner_enrolled": speaker_vault.owner_profile is not None,
     }
@@ -219,6 +355,20 @@ async def PreprocessForSTT(request: Request):
     """HP filter + spectral denoise + AGC + trim silence. Body: raw PCM."""
     pcm = await read_pcm_body(request)
     return Response(content=preprocess_for_stt(pcm), media_type="application/octet-stream")
+
+
+@app.post("/stt")
+@app.post("/transcribe")
+async def transcribeAudioEndpoint(request: Request, prompt: str = Query(default=""),
+                                  auto_preprocess: bool = Query(default=False)):
+    """STT trực tiếp trong RAM với faster-whisper (0 disk I/O). Body: raw PCM 16kHz 16-bit."""
+    pcm = await read_pcm_body(request)
+    if auto_preprocess:
+        pcm = preprocess_for_stt(pcm)
+    if not whisper_stt or not whisper_stt.model:
+        raise HTTPException(status_code=503, detail="Whisper STT chưa sẵn sàng")
+    result = await asyncio.to_thread(whisper_stt.transcribe_pcm, pcm, prompt)
+    return result
 
 
 @app.post("/voice/analyze")

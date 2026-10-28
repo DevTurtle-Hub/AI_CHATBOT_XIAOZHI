@@ -34,9 +34,11 @@ class Session extends EventEmitter {
         this.recording = null;
         this.config = {
             vadThreshold: 0.5,
-            silenceWindows: 5,
+            vadContinueThreshold: 0.3,   // hysteresis: ngưỡng giữ câu thấp hơn ngưỡng khởi động
+            silenceWindows: 5,           // 5 x 128ms = 0.64s - cân bằng: không cắt hơi thở giữa câu, không chờ thêm 0.9s
             maxSeconds: 10
         };
+        this.ttsProvider = null;   // giọng TTS thắng cuộc trong phiên (edge|gtts) - giữ ổn định
         this.metrics = {
             last: null,
             pending: null

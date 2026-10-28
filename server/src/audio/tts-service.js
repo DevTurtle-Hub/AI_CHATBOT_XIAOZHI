@@ -1,6 +1,7 @@
 'use strict';
 
 const { MPEGDecoder } = require('mpg123-decoder');
+const { getAudioBase64 } = require('google-tts-api');
 const { splitSentences } = require('../core/sentence-splitter');
 const { sleep, audioStats, newAudioTraceId, logAudioTrace } = require('./audio-utils');
 
@@ -17,7 +18,13 @@ class TtsService {
         this.leadMs = Math.max(0, Number(options.leadMs) || 1400);
         this.drainMs = Math.max(0, Number(options.drainMs) || 900);
         this.timeoutMs = Math.max(1000, Number(options.timeoutMs) || 20000);
-        this.logger = options.logger || console;
+        this._log = typeof options.logger === 'function'
+            ? options.logger
+            : ((options.logger && options.logger.log) ? options.logger.log.bind(options.logger) : console.log.bind(console));
+        // 'auto' = đua edge-tts vs gTTS ở câu đầu, giọng thắng cuộc giữ cả phiên
+        // 'edge' = luôn edge-tts (giọng HoaiMy đẹp nhưng hay chậm 1.2-3s)
+        // 'gtts' = luôn Google Translate TTS (nhanh ~0.6s, chất lượng nhỉnh hơn chút xíu kém)
+        this.provider = ['edge', 'gtts'].includes(options.provider) ? options.provider : 'auto';
         this._decoder = null;
         this._decodeLock = Promise.resolve();
     }
@@ -50,6 +57,34 @@ class TtsService {
         }
     }
 
+    // Decoder RIÊNG cho đường đua: lock chung sẽ làm chậm nhánh nhanh hơn
+    // (nhánh sau phải chờ nhánh trước decode xong -> mất ý nghĩa đua).
+    async _decodeMp3Fresh(bytes) {
+        const decoder = new MPEGDecoder();
+        await decoder.ready;
+        try {
+            return decoder.decode(bytes);
+        } finally {
+            try { decoder.free(); } catch { }
+        }
+    }
+
+    _resample16k(f32, inRate) {
+        const outRate = 16000;
+        const count = Math.floor(f32.length * outRate / inRate);
+        const pcm = Buffer.allocUnsafe(count * 2);
+        for (let i = 0; i < count; i++) {
+            const pos = i * inRate / outRate;
+            const i0 = Math.floor(pos);
+            const i1 = Math.min(f32.length - 1, i0 + 1);
+            const frac = pos - i0;
+            const value = f32[i0] * (1 - frac) + f32[i1] * frac;
+            const sample = Math.max(-32768, Math.min(32767, Math.round(value * 32767)));
+            pcm.writeInt16LE(sample, i * 2);
+        }
+        return pcm;
+    }
+
     async synthesize(text) {
         const res = await this.axios.post(
             `/tts?rate=${encodeURIComponent(this.rate)}`,
@@ -64,33 +99,79 @@ class TtsService {
         const decoded = await this._decodeMp3(new Uint8Array(res.data));
         const f32 = decoded.channelData && decoded.channelData[0];
         if (!f32 || !f32.length) throw new Error('TTS decode rỗng');
-
-        const inRate = decoded.sampleRate || 24000;
-        const outRate = 16000;
-        const count = Math.floor(f32.length * outRate / inRate);
-        const pcm = Buffer.allocUnsafe(count * 2);
-        for (let i = 0; i < count; i++) {
-            const pos = i * inRate / outRate;
-            const i0 = Math.floor(pos);
-            const i1 = Math.min(f32.length - 1, i0 + 1);
-            const frac = pos - i0;
-            const value = f32[i0] * (1 - frac) + f32[i1] * frac;
-            const sample = Math.max(-32768, Math.min(32767, Math.round(value * 32767)));
-            pcm.writeInt16LE(sample, i * 2);
-        }
-        this.logger.log(`[TTS DATA] ${(res.data.byteLength / 1024).toFixed(0)}KB mp3 -> PCM: ${audioStats(pcm)}`);
+        const pcm = this._resample16k(f32, decoded.sampleRate || 24000);
+        this._log(`[TTS DATA][edge] ${(res.data.byteLength / 1024).toFixed(0)}KB mp3 -> PCM: ${audioStats(pcm)}`);
         return pcm;
     }
 
-    async synthesizeWithRetry(text, attempts = 3) {
+    async synthesizeGtts(text) {
+        // Google Translate TTS: nhanh hơn edge-tts 2-5 lần cho câu đầu (≈600ms vs 1.2-3.6s)
+        let mp3Buf = null;
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            try {
+                const b64 = await getAudioBase64(text, 'vi');
+                mp3Buf = Buffer.from(b64, 'base64');
+                if (mp3Buf.length) break;
+            } catch (e) {
+                if (attempt >= 2) throw e;
+                await sleep(400);
+            }
+        }
+        if (!mp3Buf || !mp3Buf.length) throw new Error('gTTS trả về rỗng');
+        const decoded = await this._decodeMp3Fresh(new Uint8Array(mp3Buf));
+        const f32 = decoded.channelData && decoded.channelData[0];
+        if (!f32 || !f32.length) throw new Error('gTTS decode rỗng');
+        const pcm = this._resample16k(f32, decoded.sampleRate || 24000);
+        this._log(`[TTS DATA][gtts] ${(mp3Buf.length / 1024).toFixed(0)}KB mp3 -> PCM: ${audioStats(pcm)}`);
+        return pcm;
+    }
+
+    async _synthesizeWith(provider, text) {
+        if (provider === 'gtts') return await this.synthesizeGtts(text);
+        return await this.synthesize(text);
+    }
+
+    // Chọn nguồn tổng hợp cho 1 câu: sticky provider (nếu có) hoặc ĐUA song song.
+    // Kết quả kèm provider thắng -> ghi nhớ vào session để cả phiên dùng 1 giọng.
+    async synthesizeSmart(text, session) {
+        const sticky = session?.ttsProvider || null;
+        if (sticky && sticky !== 'auto') {
+            try {
+                return { provider: sticky, pcm: await this._synthesizeWith(sticky, text) };
+            } catch (e) {
+                this._log(`[🗣️ TTS] ${sticky} lỗi -> thử nhánh còn lại: ${e.message}`);
+                const other = sticky === 'gtts' ? 'edge' : 'gtts';
+                const pcm = await this._synthesizeWith(other, text);
+                if (session) session.ttsProvider = other;
+                return { provider: other, pcm };
+            }
+        }
+
+        if (this.provider !== 'auto') {
+            const pcm = await this._synthesizeWith(this.provider, text);
+            if (session) session.ttsProvider = this.provider;
+            return { provider: this.provider, pcm };
+        }
+
+        // ĐUA: edge-tts và gTTS chạy song song, ai xong trước lấy câu đó
+        const race = await Promise.any([
+            this.synthesize(text).then(pcm => ({ provider: 'edge', pcm })),
+            this.synthesizeGtts(text).then(pcm => ({ provider: 'gtts', pcm }))
+        ]);
+        if (session) session.ttsProvider = race.provider;
+        this._log(`[🗣️ TTS] phiên này dùng giọng: ${race.provider} (đua thắng)`);
+        return race;
+    }
+
+    async synthesizeWithRetry(text, attempts = 3, session = null) {
         let lastError = null;
         for (let attempt = 1; attempt <= attempts; attempt++) {
             try {
-                return await this.synthesize(text);
+                return await this.synthesizeSmart(text, session);
             } catch (error) {
                 lastError = error;
                 if (attempt < attempts) {
-                    this.logger.log(`[🗣️ TTS] engine lỗi (lần ${attempt}): ${error.message} -> thử lại sau...`);
+                    this._log(`[🗣️ TTS] engine lỗi (lần ${attempt}): ${error.message} -> thử lại sau...`);
                     await sleep(700 * attempt);
                 }
             }
@@ -163,21 +244,22 @@ class TtsService {
         const sentences = this.sentenceStreaming ? splitSentences(text) : [String(text)];
 
         try {
-            let nextPromise = this.synthesizeWithRetry(sentences[0], 3);
+            let nextPromise = this.synthesizeWithRetry(sentences[0], 3, session);
             nextPromise.catch(() => { });
             for (let i = 0; i < sentences.length; i++) {
-                let pcm;
+                let res;
                 try {
-                    pcm = await nextPromise;
+                    res = await nextPromise;
                 } catch (error) {
                     if (i === 0) throw error;
-                    this.logger.log(`[🗣️ TTS] bỏ câu ${i + 1}/${sentences.length}: ${error.message}`);
+                    this._log(`[🗣️ TTS] bỏ câu ${i + 1}/${sentences.length}: ${error.message}`);
                     break;
                 }
+                const pcm = res.pcm;
                 if (controller.signal.aborted || ws.readyState !== ws.OPEN) break;
 
                 if (i + 1 < sentences.length) {
-                    nextPromise = this.synthesizeWithRetry(sentences[i + 1], 3);
+                    nextPromise = this.synthesizeWithRetry(sentences[i + 1], 3, session);
                     nextPromise.catch(() => { });
                 }
 
@@ -189,13 +271,14 @@ class TtsService {
                     if (session?.markFirstChunk) session.markFirstChunk();
                     if (options.onFirstChunk) options.onFirstChunk({ at: firstChunkAt, traceId });
                     logAudioTrace(traceId, 'tts_ready', {
+                        provider: res.provider,
                         firstSentenceChars: sentences[0].length,
                         firstAudioMs: firstChunkAt - startedAt,
                         totalSentences: sentences.length
                     });
                 }
 
-                this.logger.log(`[PHAT LOA] Dang phat am thanh (${(pcm.length / this.bytesPerSec).toFixed(1)} giay, câu ${i + 1}/${sentences.length})...`);
+                this._log(`[PHAT LOA] Dang phat am thanh (${(pcm.length / this.bytesPerSec).toFixed(1)} giay, câu ${i + 1}/${sentences.length})...`);
                 const result = await this._sendPcm(ws, pcm, pacing, controller);
                 totalSent += result.sent;
                 totalChunks += result.chunks;
@@ -239,12 +322,12 @@ class TtsService {
                 maxWsBufferedBytes: pacing.maxWsBufferedBytes
             });
             if (!controller.signal.aborted) {
-                this.logger.log('[PHAT LOA] Hoan tat phat am thanh - San sang nghe lai');
+                this._log('[PHAT LOA] Hoan tat phat am thanh - San sang nghe lai');
             }
             return result;
         } catch (error) {
             logAudioTrace(traceId, 'tx_error', { error: error.message });
-            this.logger.log('[PHAT LOA] Loi phat am thanh:', error.message);
+            this._log('[PHAT LOA] Loi phat am thanh:', error.message);
             if (ws.readyState === ws.OPEN) {
                 try { ws.send('__SPEAK_END__'); } catch { }
             }
