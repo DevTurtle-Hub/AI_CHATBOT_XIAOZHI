@@ -77,6 +77,14 @@ class Session extends EventEmitter {
         this.busyTurn = false;
     }
 
+    // Chỉ nhả khóa khi turn kết thúc ĐÚNG là turn mới nhất - turn cũ (bị barge-in
+    // đè) không được mở khóa sớm, nếu không mic/AI chạy song song 2 lượt
+    releaseTurn(turn) {
+        if (turn !== this.turnSeq) return false;
+        this.busyTurn = false;
+        return true;
+    }
+
     beginTts(controller) {
         this.tts = {
             active: true,

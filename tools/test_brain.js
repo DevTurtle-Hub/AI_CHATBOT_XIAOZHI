@@ -26,7 +26,7 @@ function bump(name, ok, detail = '') {
 const srv = spawn('node', [ROOT + '/server/server.js'], {
     env: {
         ...process.env, PORT: String(PORT), XIAOXI_GREETING: '0',
-        XIAOXI_VERBOSE: '1', XIAOXI_IGNORE_OWNER_CHECK: '1', GEMINI_API_KEY: '',
+        XIAOXI_VERBOSE: '1', XIAOXI_IGNORE_OWNER_CHECK: '1', XIAOXI_ALLOW_DEBUG: '1', GEMINI_API_KEY: '',
         XIAOXI_REMINDER_SWEEP_MS: '5000'
     },
     stdio: ['ignore', 'pipe', 'pipe']

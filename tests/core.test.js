@@ -127,7 +127,7 @@ test('TtsService synthesizeSmart: tôn trọng sticky ttsProvider và fallback k
 });
 
 
-const { isPrivateHost, htmlToText } = require('../server/src/ai/web-page');
+const { isPrivateHost, isPrivateIp, assertPublicDns, htmlToText } = require('../server/src/ai/web-page');
 
 test('web-page chặn URL mạng nội bộ (chống SSRF)', () => {
     assert.equal(isPrivateHost('localhost'), true);
@@ -138,6 +138,31 @@ test('web-page chặn URL mạng nội bộ (chống SSRF)', () => {
     assert.equal(isPrivateHost('172.15.0.1'), false);
     assert.equal(isPrivateHost('news.google.com'), false);
     assert.equal(isPrivateHost(''), true);
+});
+
+test('web-page isPrivateIp: ma trận IP nội bộ vs công khai', () => {
+    assert.equal(isPrivateIp('100.64.0.1'), true);      // CGNAT
+    assert.equal(isPrivateIp('100.127.255.255'), true);
+    assert.equal(isPrivateIp('100.128.0.1'), false);
+    assert.equal(isPrivateIp('169.254.169.254'), true); // cloud metadata
+    assert.equal(isPrivateIp('198.18.0.1'), true);      // benchmarking
+    assert.equal(isPrivateIp('224.0.0.1'), true);       // multicast
+    assert.equal(isPrivateIp('8.8.8.8'), false);
+    assert.equal(isPrivateIp('1.1.1.1'), false);
+    assert.equal(isPrivateIp('::1'), true);
+    assert.equal(isPrivateIp('fd00::1'), true);         // ULA
+    assert.equal(isPrivateIp('fe80::1'), true);         // link-local
+    assert.equal(isPrivateIp('::ffff:127.0.0.1'), true); // IPv4-mapped
+    assert.equal(isPrivateIp('::ffff:8.8.8.8'), false);
+    assert.equal(isPrivateHost('::1'), true);
+    assert.equal(isPrivateHost('[::1]'), true);
+});
+
+test('web-page assertPublicDns: từ chối tên miền trỏ vào nội bộ (rebinding)', async () => {
+    assert.equal(await assertPublicDns('127.0.0.1'), 'url nội bộ');
+    assert.equal(await assertPublicDns('8.8.8.8'), null);
+    assert.ok(typeof (await assertPublicDns('localhost')) === 'string'); // PRIVATE_HOST chưa phải IP -> lookup fail/nội bộ
+    assert.equal(await assertPublicDns('definitely-not-a-real-host.invalid'), 'không phân giải được tên miền');
 });
 
 test('web-page htmlToText bỏ script/style, giữ nội dung, giải mã entity', () => {

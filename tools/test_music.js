@@ -39,7 +39,7 @@ async function up() {
         try { const h = await axios.get(`${VOICE_URL}/health`, { timeout: 700 }); if (h.status === 200) break; } catch (e) {}
         await sleep(500);
     }
-    const env = { ...process.env, PORT: String(SERVER_PORT), VOICE_ENGINE_URL: VOICE_URL, XIAOXI_GREETING: '0' };
+    const env = { ...process.env, PORT: String(SERVER_PORT), VOICE_ENGINE_URL: VOICE_URL, XIAOXI_GREETING: '0', XIAOXI_ALLOW_DEBUG: '1' };
     serverProc = spawn('node', [ROOT + '/server/server.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     serverProc.stdout.on('data', d => serverOut.push(d.toString()));
     serverProc.stderr.on('data', d => serverOut.push(d.toString()));

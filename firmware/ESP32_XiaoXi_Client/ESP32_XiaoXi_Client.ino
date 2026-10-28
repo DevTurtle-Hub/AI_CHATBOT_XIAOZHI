@@ -1428,6 +1428,8 @@ void handleProtocolMessage(const String &msg) {
     }
 
     if (type == "ping") {
+        // Nuôi watchdog chống treo mic: server gửi ping JSON (v2), KHÔNG phải "__PING__" cũ
+        lastPingAtMs = millis();
         long seq = jsonIntField(msg, "seq");
         String pong = String("{\"v\":2,\"type\":\"pong\",\"seq\":") + String(seq) + "}";
         webSocket.sendTXT(pong);
@@ -1745,9 +1747,10 @@ void micTask(void *param) {
             i2s_read(I2S_MIC_PORT, flush, sizeof(flush), &br, pdMS_TO_TICKS(5));
             continue;
         }
-        // [Watchdog] server treo giữa chừng (không __SPEAK_END__, ~20s không ping)
-        // -> mở lại mic, kẻo robot điếc vĩnh viễn
-        if (bargeGate && lastPingAtMs != 0 && millis() - lastPingAtMs > 20000) {
+        // [Watchdog] server treo giữa chừng (không __SPEAK_END__, mất ping)
+        // -> mở lại mic, kẻo robot điếc vĩnh viễn. Server ping mỗi 30s,
+        // ngưỡng 75s = cho phép rớt 2 nhịp mạng rồi mới tính là treo.
+        if (bargeGate && lastPingAtMs != 0 && millis() - lastPingAtMs > 75000) {
             Serial.println("[BARGE] Canh bao: server khong dang ping -> mo lai mic");
             bargeArmed = false;
             ttsPlaying = false;

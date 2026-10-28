@@ -27,9 +27,11 @@ if hasattr(sys.stdout, "reconfigure"):
 import numpy as np
 import onnxruntime as ort
 from fastapi import FastAPI, Request, Query, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 import edge_tts
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 
 from voice_intelligence import (
@@ -65,6 +67,8 @@ class SileroVAD:
         self.initial_state = np.zeros((2, 1, 128), dtype=np.float32)
         self.sr_tensor = np.array(SAMPLE_RATE, dtype=np.int64)   # scalar 0-d đúng chữ ký []
         self._state = {}
+        self._carry = {}
+        self._lock = threading.Lock()   # ONNX session không thread-safe
         self.reset()
 
     def _fresh_state(self):
@@ -72,11 +76,22 @@ class SileroVAD:
 
     def reset(self, device_id: str = "default"):
         self._state[device_id] = self._fresh_state()
+        self._carry.pop(device_id, None)
 
     def run_chunk(self, pcm_bytes: bytes, device_id: str = "default") -> float:
+        with self._lock:   # ONNX session + state per-device: phải chạy tuần tự
+            return self._run_chunk_locked(pcm_bytes, device_id)
+
+    def _run_chunk_locked(self, pcm_bytes: bytes, device_id: str) -> float:
         """Nhận chunk PCM16LE (n>=512 mẫu), trả về xác suất speech (0..1).
         Chuẩn Silero v5: mỗi bước feed CONTEXT 64 mẫu + 512 = 576 mẫu."""
+        #Byte lẻ KHÔNG vứt - giữ lại ghép đầu chunk sau, nếu không mọi mẫu sau
+        #bị lệch 1 byte (int16 tráo đôi) cho tới lúc reset -> VAD rác cả câu
+        if device_id in self._carry:
+            pcm_bytes = self._carry[device_id] + pcm_bytes
+            self._carry.pop(device_id)
         if len(pcm_bytes) % 2 != 0:
+            self._carry[device_id] = pcm_bytes[-1:]
             pcm_bytes = pcm_bytes[:-1]
         samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         if samples.size < 64:
@@ -298,13 +313,21 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="XiaoXi Voice Engine", version="2.0", lifespan=lifespan)
+_STT_SEM = asyncio.Semaphore(2)   # Py3.11: semaphore tự bind vào loop đang chạy
 
+
+MAX_BODY_BYTES = 32 * 1024 * 1024   # 32MB PCM ~17 phút 16k - trên nữa là từ chối (chặn DoS phình RAM)
 
 async def read_pcm_body(request: Request) -> bytes:
-    """Đọc raw body (octet-stream) -> PCM bytes."""
+    """Đọc raw body (octet-stream) -> PCM bytes, có giới hạn kích thước."""
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Body quá lớn")
     body = await request.body()
     if not body:
         raise HTTPException(status_code=400, detail="Body PCM rỗng")
+    if len(body) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="Body quá lớn")
     return body
 
 
@@ -328,9 +351,11 @@ async def VadDetection(request: Request, x_device_id: str = Query(default="defau
     dev_id = request.headers.get("x-device-id") or x_device_id
     if dev_id not in vad_engine._state:
         vad_engine.reset(dev_id)
-    prob = vad_engine.run_chunk(pcm, device_id=dev_id)
+    # ONNX + DSP loop NẶNG: đẩy ra threadpool để không starving event loop
+    # (trước đây /vad đồng bộ làm mọi request khác chờ -> timeout 700ms dây chuyền)
+    prob = await run_in_threadpool(vad_engine.run_chunk, pcm, dev_id)
 
-    acoustics = AcousticProfiler.extract_features(pcm, SAMPLE_RATE)
+    acoustics = await run_in_threadpool(AcousticProfiler.extract_features, pcm, SAMPLE_RATE)
     # Kết hợp Silero với dấu hiệu gió (>45% năng lượng trầm) để tránh ảo giác
     is_wind = acoustics.get("is_wind_noise", False)
     is_speech = prob > 0.5 and not is_wind
@@ -354,7 +379,8 @@ async def VadReset(x_device_id: str = Query(default="default")):
 async def PreprocessForSTT(request: Request):
     """HP filter + spectral denoise + AGC + trim silence. Body: raw PCM."""
     pcm = await read_pcm_body(request)
-    return Response(content=preprocess_for_stt(pcm), media_type="application/octet-stream")
+    content = await run_in_threadpool(preprocess_for_stt, pcm)
+    return Response(content=content, media_type="application/octet-stream")
 
 
 @app.post("/stt")
@@ -364,10 +390,13 @@ async def transcribeAudioEndpoint(request: Request, prompt: str = Query(default=
     """STT trực tiếp trong RAM với faster-whisper (0 disk I/O). Body: raw PCM 16kHz 16-bit."""
     pcm = await read_pcm_body(request)
     if auto_preprocess:
-        pcm = preprocess_for_stt(pcm)
+        pcm = await run_in_threadpool(preprocess_for_stt, pcm)
     if not whisper_stt or not whisper_stt.model:
         raise HTTPException(status_code=503, detail="Whisper STT chưa sẵn sàng")
-    result = await asyncio.to_thread(whisper_stt.transcribe_pcm, pcm, prompt)
+    # Giới hạn 2 lượt transcribe đồng thời: máy 4 luồng mà cho ~32 request chạy
+    # song song (default executor) là p95 sập - thà xếp hàng còn hơn nghẽn hết
+    async with _STT_SEM:
+        result = await asyncio.to_thread(whisper_stt.transcribe_pcm, pcm, prompt)
     return result
 
 
@@ -375,13 +404,15 @@ async def transcribeAudioEndpoint(request: Request, prompt: str = Query(default=
 async def analyzeVoice(request: Request, transcript: str = Query(default="")):
     """Phân tích âm học + cảm xúc SER + xác thực chủ nhân (1 lần gọi duy nhất). Body: raw PCM."""
     pcm = await read_pcm_body(request)
-    acoustics = AcousticProfiler.extract_features(pcm, SAMPLE_RATE)
+    acoustics = await run_in_threadpool(AcousticProfiler.extract_features, pcm, SAMPLE_RATE)
     emotion_data = SpeechEmotionClassifier.classify(acoustics, transcript)
 
     try:
-        speaker_data = speaker_vault.verify_speaker(pcm)
-    except Exception:
-        # Lỗi verify thì mặc định coi là chủ nhân, tránh khoá nhầm chủ nhân
+        speaker_data = await run_in_threadpool(speaker_vault.verify_speaker, pcm)
+    except Exception as e:
+        # fail-open CÓ CHỦ ĐÍCH (tránh khoá nhầm chủ nhà khỏi robot của chính họ),
+        # nhưng phải LOE ra để thấy voiceprint đang hỏng thay vì im lặng
+        print(f"[WARN] verify_speaker exception -> tạm coi là chủ nhân: {e!r}")
         speaker_data = {"speaker_name": "Chưa rõ", "is_owner": True, "similarity": 0.0}
 
     return {
@@ -394,9 +425,9 @@ async def analyzeVoice(request: Request, transcript: str = Query(default="")):
 
 @app.post("/voice/verify_speaker")
 async def verifySpeaker(request: Request, threshold: float = Query(default=0.75)):
-    """Xác thực chủ nhân qua ngân hàng mẫu đa trạng thái. Body: raw PCM."""
+    """Xác thực chủ nhân qua ngân hàng mẫu đa trạng thái. Body: raw PCM 16kHz 16-bit."""
     pcm = await read_pcm_body(request)
-    result = speaker_vault.verify_speaker(pcm, threshold=threshold)
+    result = await run_in_threadpool(speaker_vault.verify_speaker, pcm, threshold)
     return result
 
 
@@ -451,9 +482,11 @@ async def textToSpeech(request: Request, voice: str = Query(default="f1"),
             try:
                 communicate = edge_tts.Communicate(text, voice_name, rate=safe_rate)
                 mp3_chunks = []
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        mp3_chunks.append(chunk["data"])
+                # wait_for: socket của edge-tts có thể treo vĩnh viễn (DNS nửa chừng)
+                async with asyncio.timeout(20):
+                    async for chunk in communicate.stream():
+                        if chunk["type"] == "audio":
+                            mp3_chunks.append(chunk["data"])
                 mp3_data = b"".join(mp3_chunks)
                 if mp3_data:
                     break
@@ -469,9 +502,11 @@ async def textToSpeech(request: Request, voice: str = Query(default="f1"),
             mp3_data = b""
             for gatt in range(2):
                 try:
-                    buf = _io.BytesIO()
-                    gTTS(text, lang="vi").write_to_fp(buf)
-                    mp3_data = buf.getvalue()
+                    def _gtts_synthesize():   # blocking network I/O -> ra thread, đừng đói event loop
+                        buf = _io.BytesIO()
+                        gTTS(text, lang="vi").write_to_fp(buf)
+                        return buf.getvalue()
+                    mp3_data = await asyncio.to_thread(_gtts_synthesize)
                     if mp3_data:
                         break
                 except Exception:

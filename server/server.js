@@ -130,6 +130,13 @@ function tftASCII(s) {
         .trim();
 }
 
+// Frame "AI:" vào cmdQueue firmware (CMD_MSG_LEN=384) - tftASCII đã trả ASCII
+// thuần nên 1 ký tự = 1 byte; cắt 375 trừ chỗ cho prefix "AI:"
+const TFT_FRAME_MAX = 375;
+function tftAIFrame(text) {
+    return 'AI:' + tftASCII(text).slice(0, TFT_FRAME_MAX);
+}
+
 // =========================================================================
 // 0c. TÂM TRẠNG & TRÒ CHUYỆN NHƯ NGƯỜI BẠN (đọc cảm xúc anh nói, nhắc chuyện cũ)
 // =========================================================================
@@ -240,12 +247,12 @@ const AI_TOOLS = [
         type: "function",
         function: {
             name: "control_robot",
-            description: "Điều khiển Servo: head(up/down/center), leg(left/right/center)",
+            description: "Điều khiển Servo vật lý. head chỉ nhận: up/down/center. leg (quay người) chỉ nhận: left/right/center. Kết hợp khác firmware bỏ qua - đừng gửi.",
             parameters: {
                 type: "object",
                 properties: {
                     part: { type: "string", enum: ["head", "leg"] },
-                    direction: { type: "string", enum: ["up", "down", "left", "right", "center"] }
+                    direction: { type: "string", enum: ["up", "down", "center", "left", "right"] }
                 },
                 required: ["part", "direction"]
             }
@@ -435,8 +442,9 @@ function tryParseReminder(text) {
     } else if ((m = raw.match(/(\d{1,2})\s*[h:]?\s*(\d{1,2})?(?:\s*gi[ờe])?/)) && /\d/.test(m[1]) && /gi[ờe]|\d{1,2}\s*[h:]|\d{1,2}:\d{1,2}/.test(raw)) {
         let hh = num(m[1]); const mm = m[2] ? +m[2] : 0;
         if (hh == null || hh > 23 || mm > 59) return null;
-        if (/(tối|toi|chiều|chieu)/.test(raw) && hh < 12) hh += 12;
-        if (/sáng|sang/.test(raw) && hh === 12) hh = 0;
+        if (/tối|toi|đêm|dem/.test(raw)) { if (hh === 12) hh = 0; else if (hh < 12) hh += 12; }
+        else if (/(chiều|chieu|trưa|trua)/.test(raw)) { if (hh < 12) hh += 12; }         // 12 giờ chiều/trưa giữ 12
+        else if (/sáng|sang/.test(raw) && hh === 12) hh = 0;                               // 12 giờ sáng = nửa đêm qua
         due = new Date(now); due.setHours(hh, mm, 0, 0);
         if (/ngày mai|ngay mai|sáng mai|tối mai|chiều mai/.test(raw)) due.setDate(due.getDate() + 1);
         else if (due <= now) due.setDate(due.getDate() + 1);
@@ -623,7 +631,7 @@ async function startMusicSession(ws, searchLine, idx = 0) {
         musicSessions.set(ws, s);
         launchMusicStream(ws, s);
 
-        ws.send(`AI:${tftASCII(`Dạ mở luôn bài "${vids[vIdx].title}" cho anh anh ơi, nghe đi nha! (nhạc)`)}`);
+        ws.send(tftAIFrame(`Dạ mở luôn bài "${vids[vIdx].title}" cho anh anh ơi, nghe đi nha! (nhạc)`));
         ws.send(`__MUSIC_INFO__${tftASCII(vids[vIdx].title)}|${Math.max(1, Math.floor(vids[vIdx].seconds || 0))}`);
         ws.send('__SPEAK_START__');
         s.startMs = Date.now();
@@ -680,7 +688,7 @@ async function startMusicSession(ws, searchLine, idx = 0) {
         return s;
     } catch (e) {
         console.error('[NHAC] Lỗi mở nhạc:', e.message);
-        ws.send(`AI:Dạ em không tìm thấy bài "${searchLine}" nào anh ạ!`);
+        ws.send(tftAIFrame(`Dạ em không tìm thấy bài "${searchLine}" nào anh ạ!`));
         return null;
     }
 }
@@ -922,7 +930,11 @@ async function refreshMemoriesCache() {
 setInterval(refreshMemoriesCache, 60000).unref?.();
 
 async function addMemoryToDB(category, keyName, content, remindAt = null) {
-    if (!dbPool) { userMemoriesCache.push({ category, key_name: keyName, content }); return; }
+    if (!dbPool) {
+        userMemoriesCache.push({ category, key_name: keyName, content });
+        if (userMemoriesCache.length > 200) userMemoriesCache.shift();   // chống phình RAM khi offline DB
+        return;
+    }
     try {
         await dbPool.query(
             `INSERT INTO user_memories (category, key_name, content, remind_at)
@@ -1002,7 +1014,14 @@ setInterval(() => { refreshWeather().then(() => { for (const c of deviceClients)
 // thật -> nhớ cả qua restart). Khi robot đang bận (nói/nhạc) -> để lần quét sau.
 // =========================================================================
 const REMINDER_SWEEP_MS = Math.max(5000, Number(process.env.XIAOXI_REMINDER_SWEEP_MS) || 30000);
+let sweepRunning = false;   // chặn tick chồng lấn (speakToESP32 có thể lâu hơn chu kỳ quét)
 async function sweepReminders() {
+    if (!dbPool || sweepRunning) return;
+    sweepRunning = true;
+    try { await sweepRemindersInner(); }
+    finally { sweepRunning = false; }
+}
+async function sweepRemindersInner() {
     if (!dbPool) return;
     let rows;
     try {
@@ -1018,18 +1037,23 @@ async function sweepReminders() {
     if (!ws || !session || session.busyTurn) return;   // robot offline/bận -> giữ nguyên, quét lại sau
     for (const row of rows) {
         try {
-            await dbPool.query('UPDATE user_memories SET is_done = TRUE, updated_at = NOW() WHERE id = $1 AND is_done = FALSE', [row.id]);
+            // Claim atomic: nếu tick khác/turn khác đã đánh dấu xong -> rowCount=0 -> BỎ,
+            // không đọcซ้ำ lại cùng một lời nhắc
+            const claim = await dbPool.query(
+                'UPDATE user_memories SET is_done = TRUE, updated_at = NOW() WHERE id = $1 AND is_done = FALSE RETURNING id', [row.id]);
+            if (!claim.rows.length) continue;
         } catch (e) { continue; }
+        if (session.busyTurn || (musicSessions.get(ws) && musicSessions.get(ws).playing)) continue; // mới bận -> để lượt quét sau
         const text = `Dạ, đến giờ rồi anh! Anh dặn em nhắc: ${row.content} ạ.`;
         const turn = session.nextTurn();
         session.setState(STATES.SPEAK, { reason: 'reminder' });
         try { session.enqueueFace?.('__FACE_HAPPY__'); } catch (e) {}
-        if (ws.readyState === 1) { try { ws.send(`AI:${tftASCII(text)}`); } catch (e) {} }
+        if (ws.readyState === 1) { try { ws.send(tftAIFrame(text)); } catch (e) {} }
         console.log(`[NHẮC LỊCH] ${row.content}`);
         console.log(`[XIAOXI] ${text}`);
         pushConvoHistory(ws, '[đến giờ hẹn]', text, convos.get(ws)?.mood || 'neutral');
         try { await speakToESP32(ws, text); } catch (e) {}
-        session.endTurn();
+        session.releaseTurn(turn);
         if (session.isCurrentTurn(turn) && session.state === STATES.SPEAK) {
             session.setState(STATES.IDLE, { reason: 'reminder_done' });
         }
@@ -1181,6 +1205,7 @@ function handleDeviceProtocol(session, msg) {
             safeSend(session.ws, protocol.make('pong', { seq: msg.seq || 0 }));
             break;
         case 'pong':
+            session.ws.__lastPongAt = Date.now();
             break;
         case 'barge_in':
             handleBargeIn(session, msg.reason || 'voice');
@@ -1334,7 +1359,7 @@ function handleHttpRequest(req, res) {
 }
 
 const httpServer = http.createServer(handleHttpRequest);
-const wss = new WebSocketServer({ server: httpServer });
+const wss = new WebSocketServer({ server: httpServer, maxPayload: 2 * 1024 * 1024 });
 const deviceClients = new Set();
 
 wss.on('connection', (ws, req) => {
@@ -1408,7 +1433,7 @@ wss.on('connection', (ws, req) => {
             try {
                 await speakToESP32(ws, "Dạ em dậy rồi, chào anh nha! Hôm nay mình vui gì vậy anh?");
             } finally {
-                session.endTurn();
+                session.releaseTurn(turn);
                 if (session.isCurrentTurn(turn) && session.state === STATES.SPEAK) {
                     session.setState(STATES.IDLE, { reason: 'greeting_done' });
                 }
@@ -1417,8 +1442,19 @@ wss.on('connection', (ws, req) => {
     }
 
     let pingSeq = 0;
+    ws.__lastPongAt = Date.now();
+    let lastPingSentAt = 0;
     const heartbeat = setInterval(() => {
         if (!isOpen(ws)) return;
+        // [Half-open socket] ESP32 rớt WiFi giữa chừng -> TCP vẫn "open" nhưng vô dụng,
+        // mic server treo forever. Ping 30s, quá 2 chu kỳ không pong -> cắt, chờ reconnect.
+        if (lastPingSentAt && Date.now() - ws.__lastPongAt > 90000) {
+            console.log('[WS] Quá 90s không pong -> terminate socket nửa mở, đợi thiết bị kết nối lại');
+            clearInterval(heartbeat);
+            try { ws.terminate(); } catch (e) {}
+            return;
+        }
+        lastPingSentAt = Date.now();
         if (session.protocol >= 2) safeSend(ws, protocol.make('ping', { seq: ++pingSeq }));
         else safeSend(ws, '__PING__');
     }, 30000);
@@ -1483,7 +1519,7 @@ wss.on('connection', (ws, req) => {
             logAudioTrace(traceId, 'pcm_received', { bytes: big.length, durationSec: Number((big.length / 32000).toFixed(3)), pcm: audioStats(big) });
             // 2. Preprocess (trim silence + AGC) rồi STT trên nguyên đoạn
             const preprocessStartedAt = Date.now();
-            const preprocessRes = await axiosPython.post('/preprocess_for_stt', big, { responseType: 'arraybuffer' });
+            const preprocessRes = await axiosPython.post('/preprocess_for_stt', big, { responseType: 'arraybuffer', timeout: 4000 });
             const preprocessMs = Date.now() - preprocessStartedAt;
             if (!session.isCurrentTurn(turn)) return;
             const cleanAudio = Buffer.from(preprocessRes.data);
@@ -1544,7 +1580,7 @@ wss.on('connection', (ws, req) => {
             console.error("[Loi xu ly]", e.message);
             if (session.isCurrentTurn(turn)) failSession(session, 'Em chưa xử lý được câu vừa rồi, anh thử lại giúp em nhé.', 'turn_failed');
         } finally {
-            session.busyTurn = false;
+            session.releaseTurn(turn);
             if (session.isCurrentTurn(turn) && session.state === STATES.THINK) {
                 session.setState(STATES.IDLE, { reason: 'turn_end' });
             }
@@ -1576,7 +1612,7 @@ wss.on('connection', (ws, req) => {
         broadcastWeb({ type: 'user_text', sessionId: session.id, text, turn });
         // Câu của User hiển thị lên màn hình TFT ngay lập tức (ASCII an toàn font TFT)
         if (ws.readyState === ws.OPEN) {
-            ws.send(`USER:${tftASCII(text)}`);
+            ws.send('USER:' + tftASCII(text).slice(0, TFT_FRAME_MAX));
         }
 
         const isQuestionable = isAnswerableRetrieval(text, { acoustics: acoustics || {} }, segments);
@@ -1636,7 +1672,7 @@ wss.on('connection', (ws, req) => {
         console.log(`[XIAOXI] ${reply}`);
         if (ws.readyState === ws.OPEN) {
             // Gửi câu trả lời của AI: màn hình TFT sẽ xóa câu của User và hiển thị câu trả lời AI
-            ws.send(`AI:${tftASCII(reply)}`);
+            ws.send(tftAIFrame(reply));
         }
 
         // Nói to câu trả lời qua loa (edge-tts -> MP3 -> PCM 16k -> ESP32).
@@ -1674,6 +1710,12 @@ wss.on('connection', (ws, req) => {
     }
 
     async function runDebugTurn(sentence) {
+        // Kênh chữ bỏ qua xác thực giọng nói -> CHỈ bật khi test (env có chủ đích),
+        // mặc định TẮT để người lạ trên LAN không điều khiển robot qua WS
+        if (process.env.XIAOXI_ALLOW_DEBUG !== '1') {
+            console.warn('[🔒 BẢO MẬT] Khung DEBUG bị tắt (đặt XIAOXI_ALLOW_DEBUG=1 mới dùng)');
+            return;
+        }
         const text = String(sentence || '').trim();
         if (!text) return;
         // ĐỢI lượt trước nói xong (tối đa 30s) thay vì rớt im lặng - race với
@@ -1691,7 +1733,7 @@ wss.on('connection', (ws, req) => {
             console.error('[DEBUG]', e.message);
             if (session.isCurrentTurn(turn)) failSession(session, 'Lỗi xử lý lệnh chữ', 'debug_failed');
         } finally {
-            session.endTurn();
+            session.releaseTurn(turn);
             if (session.isCurrentTurn(turn) && session.state === STATES.THINK) {
                 session.setState(STATES.IDLE, { reason: 'debug_done' });
             }
@@ -1765,7 +1807,7 @@ wss.on('connection', (ws, req) => {
     let frameChain = Promise.resolve();
     ws.on('message', (data, isBinary) => {
         const textFrame = isBinary ? '' : data.toString();
-        if (textFrame === "__PONG__") return;
+        if (textFrame === "__PONG__") { ws.__lastPongAt = Date.now(); return; }
         if (textFrame === "__BARGE_IN__") { handleBargeIn(session, 'legacy_barge_in'); return; }
         if (textFrame === "__STOP__") { handleStop(session, 'legacy_stop'); return; }
 
@@ -1795,9 +1837,14 @@ wss.on('connection', (ws, req) => {
         session.endTurn();
         session.cancelTts('disconnected');
         broadcastWeb({ type: 'session_close', sessionId: session.id });
-        // Robot down WS -> hủy sạch session nhạc (yk docs, dev usa: kill lâu dài)
+        // Robot down WS -> hủy sạch session nhạc (kill process + clear timers,
+        // không để feedTimer/windowTimer cô đơn chạy tới hết đời)
         const ms = musicSessions.get(ws);
-        if (ms) { try { ms.ytdlp?.kill?.('SIGKILL'); ms.ffmpeg?.kill?.('SIGKILL'); } catch (e) {} }
+        if (ms) {
+            ms.aborted = true;
+            try { ms.ytdlp?.kill?.('SIGKILL'); ms.ffmpeg?.kill?.('SIGKILL'); } catch (e) {}
+            try { if (ms.feedTimer) clearInterval(ms.feedTimer); if (ms.windowTimer) clearInterval(ms.windowTimer); } catch (e) {}
+        }
         musicSessions.delete(ws);
     });
     ws.on('error', (e) => console.error("[WS]", e.message));
@@ -1832,9 +1879,15 @@ async function execToolCalls(choice, { ws, isOwner }) {
             musicDone = true;
         } else if (name === 'control_robot') {
             if (!isOwner) { console.log('[🔒 BẢO MẬT] Khách lạm dụng tool điều khiển -> chặn'); continue; }
-            const cmd = `__SERVO_${String(args.part).toUpperCase()}_${String(args.direction).toUpperCase()}__`;
+            const part = String(args.part || '').toLowerCase(), dir = String(args.direction || '').toLowerCase();
+            const SERVO_OK = { head: ['up', 'down', 'center'], leg: ['left', 'right', 'center'] };
+            if (!(SERVO_OK[part] || []).includes(dir)) {
+                toolMsgs.push({ role: 'tool', tool_call_id: tool.id, content: JSON.stringify({ ok: false, error: `firmware khong ho tro: head chi up/down/center, leg chi left/right/center` }) });
+                continue;
+            }
+            const cmd = `__SERVO_${part.toUpperCase()}_${dir.toUpperCase()}__`;
             if (ws?.readyState === 1) ws.send(cmd);
-            if (VERBOSE_LOG) console.log(`[⚙ SERVO] ${args.part} -> ${args.direction}`);
+            if (VERBOSE_LOG) console.log(`[⚙ SERVO] ${part} -> ${dir}`);
         } else if (name === 'remember_memory') {
             if (!isOwner) continue;
             const key = String(args.key_name || 'việc cần nhớ').slice(0, 60);
@@ -2086,7 +2139,9 @@ ${guestLine ? ' ' + guestLine : ''}${memList ? `\nTrí nhớ của anh Quy: ${me
             if (groqReply !== "SKIP_RESPONSE") pushConvoHistory(ws, userQuestion, groqReply, mood);
             return groqReply;
         } catch (errAll) {
-            console.warn('[AI RACE] Cả hai đều thất bại, fallback sang Groq độc lập:', errAll.message);
+            // Promise.any -> AggregateError (.message undefined): in từng lỗi thật để chẩn đoán
+            const why = (errAll.errors || []).map(e => e.message).join(' | ') || errAll.message;
+            console.warn('[AI RACE] Cả hai đều thất bại, fallback sang Groq độc lập:', why);
         }
     } else if (AI_PRIMARY === 'gemini') {
         const gemText = await askGemini(persona, userQuestion, geminiHistory);

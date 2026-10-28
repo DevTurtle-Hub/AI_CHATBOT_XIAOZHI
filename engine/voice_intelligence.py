@@ -23,6 +23,7 @@ import io
 import json
 import base64
 import wave
+import threading
 import numpy as np
 import requests
 from scipy import signal as sp_signal
@@ -224,6 +225,23 @@ class AcousticProfiler:
 
     @staticmethod
     def extract_features(pcm_bytes: bytes, sample_rate: int = 16000) -> dict:
+        # Memo nhỏ: /voice/analyze gọi 3 lần trên CÙNG pcm (profiler + verify x2)
+        # -> tính 1 lần, tiết kiệm ~2/3 CPU đường nóng
+        cache = AcousticProfiler._cache
+        key = (hash(pcm_bytes), sample_rate)
+        hit = cache.get(key)
+        if hit is not None and hit[0] == pcm_bytes:
+            return hit[1]
+        result = AcousticProfiler._extract_impl(pcm_bytes, sample_rate)
+        cache[key] = (pcm_bytes, result)
+        if len(cache) > 8:
+            cache.pop(next(iter(cache)))
+        return result
+
+    _cache = {}
+
+    @staticmethod
+    def _extract_impl(pcm_bytes: bytes, sample_rate: int = 16000) -> dict:
         if len(pcm_bytes) % 2 != 0:
             pcm_bytes = pcm_bytes[:-1]
         if len(pcm_bytes) < 1024:
@@ -465,7 +483,17 @@ class SpeakerVoiceprint:
 
     def __init__(self, profile_path: str = "owner_voiceprint.json"):
         self.profile_path = profile_path
+        self._save_lock = threading.Lock()
         self.owner_profile = self._load_profile()
+
+    def _persist(self, data: dict):
+        """Ghi nguyên tử: tmp + os.replace. Ghi dở mà crash/thoát -> file cũ còn
+        nguyên, không 'fail-open' vì json cụt parse lỗi."""
+        with self._save_lock:
+            tmp = self.profile_path + f".tmp{os.getpid()}"
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, self.profile_path)
 
     def _load_profile(self):
         if os.path.exists(self.profile_path):
@@ -494,8 +522,7 @@ class SpeakerVoiceprint:
                             }
                         ]
                     }
-                    with open(self.profile_path, 'w', encoding='utf-8') as f:
-                        json.dump(data, f, indent=2)
+                    self._persist(data)
 
                 sample_count = len(data.get("samples", []))
                 print(f"[🔐 Adaptive Voiceprint] Đã nạp thành công ngân hàng {sample_count} mẫu giọng của '{data.get('owner_name', 'Anh Quy')}'")
@@ -555,8 +582,7 @@ class SpeakerVoiceprint:
                 self.owner_profile.setdefault("samples", []).append(new_sample_entry)
                 print(f"[✅ Voiceprint Add] Đã thêm mẫu mới [{tag}]: F0={f0_mean:.1f}Hz - {desc}")
 
-            with open(self.profile_path, 'w', encoding='utf-8') as f:
-                json.dump(self.owner_profile, f, indent=2)
+            self._persist(self.owner_profile)
 
             return True
         except Exception as e:
@@ -733,10 +759,9 @@ class SpeakerVoiceprint:
                 self.owner_profile["total_interactions"] = self.owner_profile.get("total_interactions", 0) + 1
                 self.owner_profile["last_updated"] = str(np.datetime64('now'))
 
-                # Ghi đĩa định kỳ an toàn
+                # Ghi đĩa định kỳ an toàn (nguyên tử - xem _persist)
                 try:
-                    with open(self.profile_path, 'w', encoding='utf-8') as f:
-                        json.dump(self.owner_profile, f, indent=2, ensure_ascii=False)
+                    self._persist(self.owner_profile)
                 except Exception:
                     pass
 
@@ -858,6 +883,5 @@ class GeminiAudioNativeBrain:
         }
 
 
-# Khởi tạo thể hiện Singleton (đường dẫn tuyệt đối theo vị trí file - không phụ thuộc cwd)
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-speaker_vault = SpeakerVoiceprint(os.path.join(_BASE_DIR, "owner_voiceprint.json"))
+# (LOẠI singleton trùng: voice_engine tự tạo SpeakerVoiceprint(VOICEPRINT_PATH);
+#  hai object cùng ghi một file json -> mất anchor học được khi chạy song song)
