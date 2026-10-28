@@ -839,5 +839,6 @@ class GeminiAudioNativeBrain:
         }
 
 
-# Khởi tạo thể hiện Singleton
-speaker_vault = SpeakerVoiceprint("owner_voiceprint.json")
+# Khởi tạo thể hiện Singleton (đường dẫn tuyệt đối theo vị trí file - không phụ thuộc cwd)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+speaker_vault = SpeakerVoiceprint(os.path.join(_BASE_DIR, "owner_voiceprint.json"))

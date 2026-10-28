@@ -13,7 +13,7 @@
 //   4) Doc ket qua tren may tinh + robot tu phat lai giong minh (echo)
 // =============================================================================
 
-try { if (typeof process.loadEnvFile === 'function') process.loadEnvFile(); } catch (_) {}
+try { if (typeof process.loadEnvFile === 'function') process.loadEnvFile(require('path').resolve(__dirname, '..', '.env')); } catch (_) {}
 
 const { spawn } = require('child_process');
 const dgram = require('dgram');

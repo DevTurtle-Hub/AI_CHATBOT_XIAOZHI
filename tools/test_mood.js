@@ -10,6 +10,8 @@ const pg = require('pg');
 
 const ENGINE_PORT = 5035;
 const SERVER_PORT = 8877;
+const ROOT = require('path').resolve(__dirname, '..');
+
 const VOICE_URL   = `http://127.0.0.1:${ENGINE_PORT}`;
 const WS_URL      = `ws://127.0.0.1:${SERVER_PORT}`;
 
@@ -33,6 +35,7 @@ async function up() {
         } catch (e) { console.log('   (khong dung duoc DB de don chat_log:', e.message + ')'); }
     }
     engineProc = spawn('py', ['-3.11', '-m', 'uvicorn', 'voice_engine:app',
+        '--app-dir', ROOT + '/engine',
         '--port', String(ENGINE_PORT), '--log-level', 'warning'],
         { stdio: ['ignore', 'pipe', 'pipe'] });
     engineProc.stdout.on('data', d => engineOut.push(d.toString()));
@@ -42,7 +45,7 @@ async function up() {
         await sleep(500);
     }
     const env = { ...process.env, PORT: String(SERVER_PORT), VOICE_ENGINE_URL: VOICE_URL, XIAOXI_GREETING: '0', GEMINI_API_KEY: '' };
-    serverProc = spawn('node', ['server.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    serverProc = spawn('node', [ROOT + '/server/server.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     serverProc.stdout.on('data', d => serverOut.push(d.toString()));
     serverProc.stderr.on('data', d => serverOut.push(d.toString()));
     let ready = false;

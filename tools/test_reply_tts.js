@@ -3,7 +3,9 @@
 // Giả ESP32 bằng WS client, kiểm tra trình tự gói tin từ server.
 // Chạy: node test_reply_tts.js
 // ================================================================
-process.loadEnvFile ? 0 : 0; try { process.loadEnvFile(); } catch (e) {}
+const ROOT = require('path').resolve(__dirname, '..');
+
+try { process.loadEnvFile(ROOT + '/.env'); } catch (e) {}
 process.env.XIAOXI_IGNORE_OWNER_CHECK = '1';   // không đòi vân giọng khi test
 
 const WebSocket = require('ws');
@@ -54,6 +56,7 @@ async function synthesizePCM(text) {
 let engineProc = null, engineOut = [];
 function startEngine() {
     engineProc = spawn('py', ['-3.11', '-m', 'uvicorn', 'voice_engine:app',
+        '--app-dir', ROOT + '/engine',
         '--port', String(ENGINE_PORT), '--log-level', 'warning'],
         { stdio: ['ignore', 'pipe', 'pipe'] });
     engineProc.stdout.on('data', d => engineOut.push(d.toString()));
@@ -72,7 +75,7 @@ async function waitEngineReady() {
 let serverProc = null, serverOut = [];
 function startServer() {
     const env = { ...process.env, PORT: String(SERVER_PORT), VOICE_ENGINE_URL: VOICE_URL, XIAOXI_GREETING: '0' };
-    serverProc = spawn('node', ['server.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    serverProc = spawn('node', [ROOT + '/server/server.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     serverProc.stdout.on('data', d => serverOut.push(d.toString()));
     serverProc.stderr.on('data', d => serverOut.push(d.toString()));
 }

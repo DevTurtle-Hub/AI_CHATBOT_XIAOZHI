@@ -58,13 +58,13 @@ if errorlevel 1 (
     )
 )
 
-if not exist "silero_vad.onnx" (
-    echo [LOI] Thieu mo hinh silero_vad.onnx trong thu muc D:\IOT.
+if not exist "engine\silero_vad.onnx" (
+    echo [LOI] Thieu mo hinh silero_vad.onnx trong thu muc engine\
     exit /b 1
 )
 
 echo [*] Khoi dong Python Voice Engine bang %PY_EXE% %PY_ARGS% (port 5005)...
-start "XiaoXi Python Voice Engine" /D "%~dp0" cmd /k ""%PY_EXE%" %PY_ARGS% -u voice_engine.py"
+start "XiaoXi Python Voice Engine" /D "%~dp0" cmd /k ""%PY_EXE%" %PY_ARGS% -u engine\voice_engine.py"
 
 echo [*] Cho Python Engine khoi dong...
 powershell -NoProfile -Command "$ready=$false; for($i=0;$i -lt 20;$i++){ try{$r=Invoke-WebRequest -Uri 'http://127.0.0.1:5005/health' -UseBasicParsing -TimeoutSec 2; if($r.StatusCode -eq 200){$ready=$true; break}}catch{}; Start-Sleep -Seconds 1 }; if($ready){Write-Host '[OK] Python Engine san sang'}else{Write-Host '[LOI] Engine khong san sang sau 20 giay'; exit 1}"
@@ -74,6 +74,6 @@ if errorlevel 1 (
 )
 
 echo [*] Khoi dong Node.js Gateway (port 8765)...
-node server.js
+node server\server.js
 endlocal
 

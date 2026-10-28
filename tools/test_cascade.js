@@ -9,7 +9,9 @@ const axios = require('axios');
 const { MPEGDecoder } = require('mpg123-decoder');
 const { Pool } = require('pg');
 
-try { if (typeof process.loadEnvFile === 'function') process.loadEnvFile(); } catch (e) {}
+const ROOT = require('path').resolve(__dirname, '..');
+
+try { if (typeof process.loadEnvFile === 'function') process.loadEnvFile(ROOT + '/.env'); } catch (e) {}
 
 const ENGINE_PORT = 5015;
 const SERVER_PORT = 8876;
@@ -58,6 +60,7 @@ let engineProc = null;
 let engineOut = [];
 function startEngine() {
     engineProc = spawn('py', ['-3.11', '-m', 'uvicorn', 'voice_engine:app',
+        '--app-dir', ROOT + '/engine',
         '--port', String(ENGINE_PORT), '--log-level', 'warning'],
         { stdio: ['ignore', 'pipe', 'pipe'] });
     engineProc.stdout.on('data', d => engineOut.push(d.toString()));
@@ -82,7 +85,7 @@ function startServer(envOverrides = {}) {
         XIAOXI_GREETING: '0',
         ...envOverrides
     };
-    const child = spawn('node', ['server.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('node', [ROOT + '/server/server.js'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     const shards = [];
     child.stdout.on('data', d => shards.push(d.toString()));
     child.stderr.on('data', d => shards.push(d.toString()));

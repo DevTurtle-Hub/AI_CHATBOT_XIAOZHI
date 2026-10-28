@@ -3,10 +3,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { StateMachine, STATES } = require('../src/core/state-machine');
-const { splitSentences } = require('../src/core/sentence-splitter');
-const protocol = require('../src/core/protocol');
-const { Session } = require('../src/core/session');
+const { StateMachine, STATES } = require('../server/src/core/state-machine');
+const { splitSentences } = require('../server/src/core/sentence-splitter');
+const protocol = require('../server/src/core/protocol');
+const { Session } = require('../server/src/core/session');
 
 test('state machine cho phép luồng IDLE -> LISTEN -> THINK -> SPEAK -> IDLE', () => {
     const sm = new StateMachine();

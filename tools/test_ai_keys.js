@@ -4,7 +4,7 @@
 // =========================================================================
 const axios = require('axios');
 
-try { if (typeof process.loadEnvFile === 'function') process.loadEnvFile(); } catch (e) {}
+try { if (typeof process.loadEnvFile === 'function') process.loadEnvFile(require('path').resolve(__dirname, '..', '.env')); } catch (e) {}
 
 const GROQ_API_KEY  = process.env.GROQ_API_KEY  || "";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
