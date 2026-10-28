@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XiaoXi Control Center</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #070b12;
+  --panel: #0d1420;
+  --panel2: #111b2b;
+  --line: #1d2b42;
+  --text: #dbe7f5;
+  --muted: #7f93ab;
+  --accent: #4cc9f0;
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --bad: #fb7185;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: radial-gradient(1200px 700px at 10% -10%, #12304a 0%, transparent 55%), var(--bg);
+  color: var(--text);
+  font: 14px/1.5 "Segoe UI", Roboto, Arial, sans-serif;
+  min-height: 100vh;
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 22px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(8, 13, 22, 0.78);
+  backdrop-filter: blur(10px);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+.logo {
+  width: 34px; height: 34px; border-radius: 10px;
+  display: grid; place-items: center;
+  background: linear-gradient(135deg, #4cc9f0, #7c3aed);
+  font-weight: 700; color: #041018;
+}
+h1 { font-size: 17px; margin: 0; letter-spacing: 0.4px; }
+.sub { color: var(--muted); font-size: 12px; }
+.spacer { flex: 1; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); display: inline-block; margin-right: 6px; }
+.dot.on { background: var(--ok); box-shadow: 0 0 12px var(--ok); }
+.layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 18px; padding: 18px; }
+.card {
+  background: linear-gradient(180deg, var(--panel), var(--panel2));
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+.card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--muted); margin: 0; padding: 14px 16px 8px; }
+.sessions { padding: 0 10px 10px; display: grid; gap: 8px; }
+.session {
+  border: 1px solid var(--line);
+  background: #0a111c;
+  border-radius: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+.session:hover { border-color: #2d4668; }
+.session.active { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(76, 201, 240, 0.24) inset; }
+.session .id { font-family: Consolas, monospace; font-size: 12px; }
+.session .meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.main { display: grid; gap: 18px; align-content: start; }
+.device-head { display: flex; align-items: center; gap: 12px; padding: 16px; }
+.device-title { font-family: Consolas, monospace; font-size: 18px; }
+.badge { padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: 0.6px; border: 1px solid transparent; }
+.badge.IDLE { color: var(--muted); border-color: #334155; background: #0f172a; }
+.badge.LISTEN { color: #67e8f9; border-color: #0e7490; background: #082f49; }
+.badge.THINK { color: #fde68a; border-color: #a16207; background: #2a1c05; }
+.badge.SPEAK { color: #86efac; border-color: #15803d; background: #052e16; }
+.badge.ERROR { color: #fda4af; border-color: #be123c; background: #3b0712; }
+.grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; padding: 0 16px 16px; }
+.metric { background: #0a111c; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.metric .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.7px; }
+.metric .v { font-size: 20px; font-weight: 650; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.panel-body { padding: 0 16px 16px; display: grid; gap: 12px; }
+.transcript { display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 10px; align-items: start; }
+.transcript .who { color: var(--muted); font-size: 12px; padding-top: 8px; }
+.bubble { background: #0a111c; border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; min-height: 38px; white-space: pre-wrap; word-break: break-word; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; }
+button {
+  border: 1px solid var(--line);
+  background: #142033;
+  color: var(--text);
+  border-radius: 9px;
+  padding: 8px 13px;
+  cursor: pointer;
+  font: inherit;
+}
+button:hover { border-color: #35547a; background: #182944; }
+button.primary { background: #0b4a63; border-color: #0e7490; }
+button.danger { background: #4a1020; border-color: #9f1239; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+input[type="text"] {
+  flex: 1; min-width: 180px;
+  background: #0a111c; color: var(--text);
+  border: 1px solid var(--line); border-radius: 9px;
+  padding: 9px 11px; font: inherit;
+}
+input[type="text"]:focus, button:focus { outline: 2px solid rgba(76, 201, 240, 0.35); outline-offset: 1px; }
+.config { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.config label { color: var(--muted); font-size: 12px; display: grid; gap: 6px; }
+.config input[type="range"] { width: 100%; accent-color: var(--accent); }
+.config .num { color: var(--text); font-variant-numeric: tabular-nums; }
+.log { padding: 0 16px 16px; }
+.log-list {
+  height: 190px; overflow: auto; background: #050a11;
+  border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+  font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px;
+}
+.log-line { white-space: pre-wrap; word-break: break-word; border-bottom: 1px solid rgba(29, 43, 66, 0.55); padding: 3px 0; }
+.log-line .t { color: #5f7590; margin-right: 8px; }
+.empty { color: var(--muted); padding: 16px; text-align: center; }
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; }
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .config { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">XX</div>
+  <div>
+    <h1>XiaoXi Control Center</h1>
+    <div class="sub" id="serverInfo">Đang kết nối...</div>
+  </div>
+  <div class="spacer"></div>
+  <div class="sub"><span class="dot" id="connDot"></span><span id="connText">offline</span></div>
+  <div class="sub"><span id="deviceCount">0</span> thiết bị</div>
+</header>
+
+<div class="layout">
+  <aside class="card">
+    <h2>Thiết bị</h2>
+    <div class="sessions" id="sessions">
+      <div class="empty">Chưa có thiết bị kết nối</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <section class="card">
+      <div class="device-head">
+        <div class="device-title" id="deviceTitle">Chọn một thiết bị</div>
+        <span class="badge IDLE" id="stateBadge">IDLE</span>
+        <div class="spacer"></div>
+        <span class="sub" id="deviceMeta">-</span>
+      </div>
+      <div class="grid">
+        <div class="metric"><div class="k">STT</div><div class="v" id="mStt">-</div></div>
+        <div class="metric"><div class="k">AI</div><div class="v" id="mAi">-</div></div>
+        <div class="metric"><div class="k">TTS first</div><div class="v" id="mTts">-</div></div>
+        <div class="metric"><div class="k">Total</div><div class="v" id="mTotal">-</div></div>
+      </div>
+      <div class="panel-body">
+        <div class="transcript">
+          <div class="who">Anh</div>
+          <div class="bubble" id="userText">-</div>
+        </div>
+        <div class="transcript">
+          <div class="who">XiaoXi</div>
+          <div class="bubble" id="aiText">-</div>
+        </div>
+        <div class="controls">
+          <button class="primary" id="btnBarge">Ngắt lời (barge-in)</button>
+          <button class="danger" id="btnStop">Dừng</button>
+          <button id="btnHistory">Xem lịch sử</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Lệnh chữ</h2>
+      <div class="panel-body">
+        <div class="row">
+          <input type="text" id="debugText" placeholder='Ví dụ: "em ơi hôm nay thế nào"'>
+          <button id="btnDebug">Gửi</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Cấu hình VAD</h2>
+      <div class="panel-body">
+        <div class="config">
+          <label>Ngưỡng VAD <span class="num" id="vadVal">0.50</span>
+            <input type="range" id="vadThreshold" min="0.10" max="0.95" step="0.05" value="0.50">
+          </label>
+          <label>Cửa sổ lặng <span class="num" id="silVal">5</span>
+            <input type="range" id="silenceWindows" min="2" max="20" step="1" value="5">
+          </label>
+          <label>Thời lượng tối đa (s) <span class="num" id="maxVal">10</span>
+            <input type="range" id="maxSeconds" min="2" max="30" step="1" value="10">
+          </label>
+        </div>
+        <div class="controls">
+          <button id="btnConfig">Áp dụng cấu hình</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Nhật ký</h2>
+      <div class="log">
+        <div class="log-list" id="logList"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+(() => {
+  const sessions = new Map();
+  let selectedId = null;
+  let socket = null;
+  let reconnectTimer = null;
+
+  const $ = (id) => document.getElementById(id);
+  const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+  const fmtMs = (value) => Number.isFinite(Number(value)) ? `${Math.round(Number(value))} ms` : '-';
+
+  function log(message, kind = '') {
+    const list = $('logList');
+    const line = document.createElement('div');
+    line.className = 'log-line';
+    line.innerHTML = `<span class="t">${new Date().toLocaleTimeString('vi-VN')}</span>${esc(message)}`;
+    if (kind === 'error') line.style.color = 'var(--bad)';
+    if (kind === 'warn') line.style.color = 'var(--warn)';
+    list.prepend(line);
+    while (list.children.length > 200) list.lastChild.remove();
+  }
+
+  function setConn(on) {
+    $('connDot').classList.toggle('on', on);
+    $('connText').textContent = on ? 'online' : 'offline';
+  }
+
+  function selected() {
+    return selectedId ? sessions.get(selectedId) : null;
+  }
+
+  function renderSessions() {
+    const box = $('sessions');
+    $('deviceCount').textContent = sessions.size;
+    if (!sessions.size) {
+      box.innerHTML = '<div class="empty">Chưa có thiết bị kết nối</div>';
+      return;
+    }
+    box.innerHTML = [...sessions.values()].map((session) => `
+      <div class="session ${session.id === selectedId ? 'active' : ''}" data-id="${esc(session.id)}">
+        <div class="id">${esc(session.id)}</div>
+        <div class="meta">${esc(session.state || 'IDLE')} · protocol ${esc(session.protocol || 1)}${session.busy ? ' · busy' : ''}</div>
+      </div>
+    `).join('');
+    for (const el of box.querySelectorAll('.session')) {
+      el.addEventListener('click', () => {
+        selectedId = el.dataset.id;
+        renderSessions();
+        renderSelected();
+      });
+    }
+  }
+
+  function renderSelected() {
+    const session = selected();
+    const badge = $('stateBadge');
+    if (!session) {
+      $('deviceTitle').textContent = 'Chọn một thiết bị';
+      $('deviceMeta').textContent = '-';
+      badge.textContent = 'IDLE';
+      badge.className = 'badge IDLE';
+      $('mStt').textContent = '-';
+      $('mAi').textContent = '-';
+      $('mTts').textContent = '-';
+      $('mTotal').textContent = '-';
+      $('userText').textContent = '-';
+      $('aiText').textContent = '-';
+      return;
+    }
+    $('deviceTitle').textContent = session.id;
+    $('deviceMeta').textContent = `protocol ${session.protocol || 1} · ${session.capabilities?.join(', ') || 'legacy'}`;
+    const state = session.state || 'IDLE';
+    badge.textContent = state;
+    badge.className = `badge ${state}`;
+    const metrics = session.metrics || {};
+    $('mStt').textContent = fmtMs(metrics.sttMs);
+    $('mAi').textContent = fmtMs(metrics.aiMs);
+    $('mTts').textContent = fmtMs(metrics.ttsFirstAudioMs);
+    $('mTotal').textContent = fmtMs(metrics.totalMs);
+    $('userText').textContent = session.userText || '-';
+    $('aiText').textContent = session.aiText || '-';
+    const cfg = session.config || {};
+    if (Number.isFinite(Number(cfg.vadThreshold))) $('vadThreshold').value = cfg.vadThreshold;
+    if (Number.isFinite(Number(cfg.silenceWindows))) $('silenceWindows').value = cfg.silenceWindows;
+    if (Number.isFinite(Number(cfg.maxSeconds))) $('maxSeconds').value = cfg.maxSeconds;
+    updateConfigLabels();
+  }
+
+  function updateConfigLabels() {
+    $('vadVal').textContent = Number($('vadThreshold').value).toFixed(2);
+    $('silVal').textContent = $('silenceWindows').value;
+    $('maxVal').textContent = $('maxSeconds').value;
+  }
+
+  function sendCommand(action, extra = {}) {
+    const session = selected();
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (!session) {
+      log('Chưa chọn thiết bị', 'warn');
+      return;
+    }
+    socket.send(JSON.stringify({ type: 'command', sessionId: session.id, action, ...extra }));
+  }
+
+  function upsertSession(raw) {
+    if (!raw || !raw.id) return;
+    const existing = sessions.get(raw.id) || {};
+    sessions.set(raw.id, { ...existing, ...raw });
+    if (!selectedId) selectedId = raw.id;
+    renderSessions();
+    if (selectedId === raw.id) renderSelected();
+  }
+
+  function handleEvent(msg) {
+    switch (msg.type) {
+      case 'welcome':
+        $('serverInfo').textContent = `${msg.server?.name || 'XiaoXi'} v${msg.server?.version || '?'} · protocol v${msg.protocol || 2}`;
+        break;
+      case 'snapshot':
+        sessions.clear();
+        for (const session of msg.sessions || []) sessions.set(session.id, session);
+        if (!sessions.has(selectedId)) selectedId = sessions.keys().next().value || null;
+        renderSessions();
+        renderSelected();
+        break;
+      case 'session_open':
+      case 'session_update':
+        if (msg.oldId && msg.oldId !== msg.session?.id) {
+          sessions.delete(msg.oldId);
+          if (selectedId === msg.oldId) selectedId = msg.session.id;
+        }
+        upsertSession(msg.session);
+        log(`Thiết bị ${msg.session?.id || '?'} ${msg.type === 'session_open' ? 'kết nối' : 'cập nhật'}`);
+        break;
+      case 'session_close':
+        sessions.delete(msg.sessionId);
+        if (selectedId === msg.sessionId) selectedId = sessions.keys().next().value || null;
+        renderSessions();
+        renderSelected();
+        log(`Thiết bị ${msg.sessionId} ngắt kết nối`, 'warn');
+        break;
+      case 'state': {
+        const session = sessions.get(msg.sessionId);
+        if (session) session.state = msg.state;
+        if (msg.sessionId === selectedId) renderSelected();
+        renderSessions();
+        log(`${msg.sessionId}: ${msg.from} -> ${msg.state} (${msg.reason || ''})`);
+        break;
+      }
+      case 'user_text': {
+        const session = sessions.get(msg.sessionId);
+        if (session) session.userText = msg.text;
+        if (msg.sessionId === selectedId) renderSelected();
+        break;
+      }
+      case 'ai_text': {
+        const session = sessions.get(msg.sessionId);
+        if (session) session.aiText = msg.text;
+        if (msg.sessionId === selectedId) renderSelected();
+        break;
+      }
+      case 'config': {
+        const session = sessions.get(msg.sessionId);
+        if (session) session.config = msg.config;
+        if (msg.sessionId === selectedId) renderSelected();
+        break;
+      }
+      case 'metrics': {
+        const session = sessions.get(msg.sessionId);
+        if (session) session.metrics = msg.metrics;
+        if (msg.sessionId === selectedId) renderSelected();
+        log(`${msg.sessionId}: STT ${fmtMs(msg.metrics?.sttMs)} | AI ${fmtMs(msg.metrics?.aiMs)} | TTS ${fmtMs(msg.metrics?.ttsFirstAudioMs)} | total ${fmtMs(msg.metrics?.totalMs)}`);
+        break;
+      }
+      case 'barge_in':
+        log(`${msg.sessionId}: barge-in (${msg.reason || ''})`, 'warn');
+        break;
+      case 'stop':
+        log(`${msg.sessionId}: stop (${msg.reason || ''})`, 'warn');
+        break;
+      case 'error':
+        log(`${msg.sessionId || ''}: ${msg.message || msg.code || 'error'}`, 'error');
+        break;
+      case 'device_metrics':
+        log(`${msg.sessionId}: device metrics`, '');
+        break;
+      case 'history':
+        log(`${msg.sessionId}: ${(msg.history || []).length} lượt hội thoại`);
+        for (const item of msg.history || []) log(`  anh: ${item.user} | em: ${item.ai}`);
+        break;
+      case 'warning':
+        log(msg.message || 'warning', 'warn');
+        break;
+      default:
+        break;
+    }
+  }
+
+  function connect() {
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+    const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+    socket = new WebSocket(`${scheme}://${location.host}/?role=web`);
+    socket.addEventListener('open', () => {
+      setConn(true);
+      log('Dashboard đã kết nối');
+      socket.send(JSON.stringify({ type: 'hello' }));
+    });
+    socket.addEventListener('message', (event) => {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch { return; }
+      handleEvent(msg);
+    });
+    socket.addEventListener('close', () => {
+      setConn(false);
+      log('Dashboard mất kết nối, đang thử lại...', 'warn');
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, 2000);
+    });
+    socket.addEventListener('error', () => {
+      try { socket.close(); } catch { }
+    });
+  }
+
+  $('btnBarge').addEventListener('click', () => sendCommand('barge_in'));
+  $('btnStop').addEventListener('click', () => sendCommand('stop'));
+  $('btnHistory').addEventListener('click', () => sendCommand('history'));
+  $('btnDebug').addEventListener('click', () => {
+    const text = $('debugText').value.trim();
+    if (!text) return;
+    sendCommand('debug', { text });
+    $('debugText').value = '';
+  });
+  $('debugText').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') $('btnDebug').click();
+  });
+  for (const id of ['vadThreshold', 'silenceWindows', 'maxSeconds']) {
+    $(id).addEventListener('input', updateConfigLabels);
+  }
+  $('btnConfig').addEventListener('click', () => {
+    sendCommand('config', {
+      config: {
+        vad_threshold: Number($('vadThreshold').value),
+        silence_windows: Number($('silenceWindows').value),
+        max_seconds: Number($('maxSeconds').value)
+      }
+    });
+  });
+
+  renderSessions();
+  renderSelected();
+  connect();
+})();
+</script>
+</body>
+</html>

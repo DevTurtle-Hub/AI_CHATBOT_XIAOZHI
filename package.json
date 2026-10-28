@@ -1,0 +1,51 @@
+{
+  "name": "xiaoxi-ai-robot-server",
+  "version": "3.0.0",
+  "description": "Edge AI Gateway for XiaoXi ESP32 robot: Silero VAD, whisper STT, Gemini->Groq cascade LLM, Neon memories + chat_log, mood->face engine, TTS streaming, smart MUSIC player (yt-dlp+ffmpeg), TFT live UI: chat bubbles + music screen + clock/weather",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "init-db": "node init_db.js",
+    "dev": "concurrently -k -n ENGINE,GATEWAY -c '#2E86FF,#39C457' \"py -3.11 voice_engine.py\" \"node server.js\"",
+    "test": "node --test tests/core.test.js",
+    "test.core": "node --test tests/core.test.js",
+    "test.keys": "node test_ai_keys.js",
+    "test.cascade": "node test_cascade.js",
+    "test.tts": "node test_reply_tts.js",
+    "test.mood": "node test_mood.js",
+    "test.music": "node test_music.js",
+    "test.loopback": "node loopback_test.js"
+  },
+  "keywords": [
+    "robot",
+    "ai",
+    "esp32",
+    "websocket",
+    "voice",
+    "silero-vad",
+    "gemini",
+    "groq"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@distube/ytdl-core": "^4.16.12",
+    "axios": "^1.20.0",
+    "chokidar": "^5.0.0",
+    "ffmpeg-static": "^5.3.0",
+    "form-data": "^4.0.6",
+    "google-tts-api": "^2.0.2",
+    "mpg123-decoder": "^1.0.3",
+    "pg": "^8.23.0",
+    "play-dl": "^1.9.7",
+    "soundcloud-scraper": "^5.0.3",
+    "ws": "^8.21.3",
+    "yt-search": "^2.13.1",
+    "yt-stream": "^1.7.4",
+    "zingmp3-api-full": "^1.0.14"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.6"
+  }
+}

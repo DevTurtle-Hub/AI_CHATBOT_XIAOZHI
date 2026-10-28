@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# XiaoXi AI Robot - git ignore
+# ---------------------------------------------------------------------------
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# PlatformIO / ESP32 build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets (API keys, DB URL) - never commit
+.env
+.env.local
+.env.*.local
+
+# OS / editor noise
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/

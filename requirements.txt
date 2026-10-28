@@ -1,0 +1,8 @@
+numpy>=1.26,<3
+onnxruntime>=1.18,<2
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
+edge-tts>=6.1,<8
+scipy>=1.12,<2
+requests>=2.31,<3
+gTTS>=2.5,<3
