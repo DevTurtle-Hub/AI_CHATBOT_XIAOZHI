@@ -28,3 +28,9 @@ Thumbs.db
 .DS_Store
 .idea/
 .vscode/
+
+# Qoder CLI session data (local-only)
+.qoder/
+
+# Test scratch logs (local-only)
+tools/_*.log
