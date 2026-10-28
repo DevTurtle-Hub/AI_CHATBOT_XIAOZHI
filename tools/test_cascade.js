@@ -58,6 +58,7 @@ async function synthesizePCM(text) {
 // ---------------------------------------------------------------
 let engineProc = null;
 let engineOut = [];
+let srvA = null, srvB = null, srvC = null;
 function startEngine() {
     engineProc = spawn('py', ['-3.11', '-m', 'uvicorn', 'voice_engine:app',
         '--app-dir', ROOT + '/engine',
@@ -95,27 +96,46 @@ function startServer(envOverrides = {}) {
         stop: () => new Promise((resolve) => {
             let done = false;
             child.on('exit', () => { if (!done) { done = true; resolve(); } });
-            try { child.kill('SIGTERM'); } catch (e) {}
-            setTimeout(() => { try { child.kill('SIGKILL'); } catch (e) {} if (!done) { done = true; resolve(); } }, 3000);
+            if (process.platform === 'win32' && child.pid) {
+                try { spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' }); } catch (e) {}
+            } else {
+                try { child.kill('SIGTERM'); } catch (e) {}
+            }
+            setTimeout(() => { if (!done) { done = true; resolve(); } }, 1500);
         })
     };
 }
 
-function connectWS() {
-    return new Promise((resolve, reject) => {
-        const ws = new WebSocket(WS_URL);
-        const msgs = [];
-        ws.on('message', (data, isBin) => { if (!isBin) msgs.push(data.toString()); });
-        ws.on('open', () => resolve({ ws, msgs }));
-        ws.on('error', reject);
-    });
+async function connectWS(maxTries = 15) {
+    for (let i = 0; i < maxTries; i++) {
+        try {
+            return await new Promise((resolve, reject) => {
+                const ws = new WebSocket(WS_URL);
+                const msgs = [];
+                ws.on('message', (data, isBin) => { if (!isBin) msgs.push(data.toString()); });
+                ws.on('open', () => resolve({ ws, msgs }));
+                ws.on('error', reject);
+            });
+        } catch (e) {
+            if (i === maxTries - 1) throw e;
+            await sleep(500);
+        }
+    }
 }
 
-async function speakOnce({ ws, msgs, pcm, waitMs = 9000 }) {
+async function speakOnce({ ws, msgs, pcm, waitMs = 16000 }) {
     await sleep(400);
     const before = msgs.length;
     ws.send(pcm);
-    await sleep(waitMs);
+    const t0 = Date.now();
+    while (Date.now() - t0 < waitMs) {
+        await sleep(200);
+        const newMsgs = msgs.slice(before);
+        if (newMsgs.includes('__SPEAK_END__')) {
+            await sleep(400); // Chờ lắng nghe chuyển trạng thái hoàn tất
+            break;
+        }
+    }
     return msgs.slice(before);
 }
 
@@ -149,20 +169,30 @@ async function main() {
 
     // ---------- KỊCH BẢN A: thường (Gemini ưu tiên + local 0-token) ----------
     console.log('\n[A] Server binh thuong (Gemini uu tien, override chu nhan)');
-    const srvA = startServer({ XIAOXI_IGNORE_OWNER_CHECK: '1', GEMINI_TIMEOUT_MS: '20000' });
+    srvA = startServer({ XIAOXI_IGNORE_OWNER_CHECK: '1', GEMINI_TIMEOUT_MS: '20000' });
     await sleep(2500);
     const connA = await connectWS();
     await sleep(1200);
 
     let cmds = await speakOnce({ ws: connA.ws, msgs: connA.msgs, pcm: pcmServo });
+    const a1Pass = hasSub(cmds, '__SERVO_HEAD_UP__') && srvA.outText().includes('[⚡ LOCAL (0 token)]');
+    if (!a1Pass) {
+        console.log('[DEBUG A1 cmds]:', cmds);
+        console.log('[DEBUG A1 outText]:', srvA.outText().slice(-600));
+    }
     bump('A1. LENH SERVO LOCAL (0 token)',
-         hasSub(cmds, '__SERVO_HEAD_UP__') && srvA.outText().includes('[⚡ LOCAL (0 token)]'),
+         a1Pass,
          cmds.filter(c => c.startsWith('TEXT')).join(' | ').slice(0, 80));
 
-    cmds = await speakOnce({ ws: connA.ws, msgs: connA.msgs, pcm: pcmMem });
+    cmds = await speakOnce({ ws: connA.ws, msgs: connA.msgs, pcm: pcmMem, waitMs: 14000 });
+    const a2Pass = replies(cmds).some(c => replyText(c).toLowerCase().includes('ghi nho')) &&
+                   srvA.outText().includes('[⚡ LOCAL (0 token)]');
+    if (!a2Pass) {
+        console.log('[DEBUG A2 cmds]:', cmds);
+        console.log('[DEBUG A2 outText]:', srvA.outText().slice(-600));
+    }
     bump('A2. GHI NHO LOCAL (0 token)',
-         replies(cmds).some(c => replyText(c).toLowerCase().includes('ghi nho')) &&
-         srvA.outText().includes('[⚡ LOCAL (0 token)]'),
+         a2Pass,
          replies(cmds).map(replyText).join(' | ').slice(0, 90));
 
     cmds = await speakOnce({ ws: connA.ws, msgs: connA.msgs, pcm: pcmAsk, waitMs: 24000 });
@@ -194,7 +224,7 @@ async function main() {
 
     // ---------- KỊCH BẢN B: GEMINI TẮT KEY -> FALLBACK GROQ ----------
     console.log('\n[B] GEMINI_API_KEY trong -> phai fallback Groq');
-    const srvB = startServer({ XIAOXI_IGNORE_OWNER_CHECK: '1', GEMINI_API_KEY: '' });
+    srvB = startServer({ XIAOXI_IGNORE_OWNER_CHECK: '1', GEMINI_API_KEY: '' });
     await sleep(2500);
     const connB = await connectWS();
     await sleep(1200);
@@ -209,7 +239,7 @@ async function main() {
 
     // ---------- KỊCH BẢN C: KHÁCH LẠ LỆNH SERVO -> BỊ CHẶN ----------
     console.log('\n[C] Khach la (KHONG co ignore_owner_check) lenh servo');
-    const srvC = startServer({});
+    srvC = startServer({});
     await sleep(2500);
     const connC = await connectWS();
     await sleep(1200);
@@ -226,7 +256,11 @@ async function main() {
     await srvC.stop();
 
     // Kill engine sau cùng
-    try { engineProc.kill('SIGTERM'); } catch (e) {}
+    if (process.platform === 'win32' && engineProc?.pid) {
+        try { spawn('taskkill', ['/PID', String(engineProc.pid), '/T', '/F'], { stdio: 'ignore' }); } catch (e) {}
+    } else {
+        try { engineProc.kill('SIGTERM'); } catch (e) {}
+    }
 
     // ---------- TỔNG ----------
     const passed = results.filter(r => r.ok).length;
@@ -238,5 +272,11 @@ async function main() {
 
 main().catch((e) => {
     console.error('\n[TEST LOI]', e);
+    if (typeof srvA !== 'undefined' && srvA?.outText) {
+        console.error('\n[SERVER OUTPUT]:\n', srvA.outText());
+    }
+    if (typeof engineOut !== 'undefined') {
+        console.error('\n[ENGINE OUTPUT]:\n', engineOut.join(''));
+    }
     process.exit(1);
 });

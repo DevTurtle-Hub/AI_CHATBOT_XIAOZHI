@@ -86,3 +86,117 @@ test('session state phản ánh state machine', () => {
     assert.equal(session.state, STATES.LISTEN);
     assert.equal(session.toJSON().state, STATES.LISTEN);
 });
+
+test('session cấu hình: silenceWindows mặc định 5 + hysteresis vadContinueThreshold, ttsProvider khởi tạo null', () => {
+    const session = new Session({ ws: null, id: 'test', role: 'device' });
+    assert.equal(session.config.silenceWindows, 5);
+    assert.equal(session.config.vadThreshold, 0.5);
+    assert.equal(session.config.vadContinueThreshold, 0.3);
+    assert.ok(session.config.vadContinueThreshold < session.config.vadThreshold);
+    assert.equal(session.ttsProvider, null);
+});
+
+test('TtsService synthesizeSmart: tôn trọng sticky ttsProvider và fallback khi lỗi', async () => {
+    const { TtsService } = require('../server/src/audio/tts-service');
+    const service = new TtsService({ provider: 'auto' });
+    const calls = [];
+    service._synthesizeWith = async (provider, text) => {
+        calls.push({ provider, text });
+        if (provider === 'edge-fail') throw new Error('edge network error');
+        return Buffer.from([1, 2, 3, 4]);
+    };
+
+    const session = new Session({ ws: null, id: 'test', role: 'device' });
+
+    // 1. Session có sticky provider = 'gtts'
+    session.ttsProvider = 'gtts';
+    const res1 = await service.synthesizeSmart('Chào anh', session);
+    assert.equal(res1.provider, 'gtts');
+    assert.equal(session.ttsProvider, 'gtts');
+    assert.equal(calls[0].provider, 'gtts');
+
+    // 2. Sticky provider bị lỗi -> tự fallback sang 'edge' và ghi nhớ session.ttsProvider = 'edge'
+    session.ttsProvider = 'gtts';
+    service._synthesizeWith = async (provider, text) => {
+        if (provider === 'gtts') throw new Error('gtts timeout');
+        return Buffer.from([5, 6]);
+    };
+    const res2 = await service.synthesizeSmart('Câu tiếp theo', session);
+    assert.equal(res2.provider, 'edge');
+    assert.equal(session.ttsProvider, 'edge');
+});
+
+
+const { isPrivateHost, htmlToText } = require('../server/src/ai/web-page');
+
+test('web-page chặn URL mạng nội bộ (chống SSRF)', () => {
+    assert.equal(isPrivateHost('localhost'), true);
+    assert.equal(isPrivateHost('127.0.0.1'), true);
+    assert.equal(isPrivateHost('192.168.1.10'), true);
+    assert.equal(isPrivateHost('10.0.0.5'), true);
+    assert.equal(isPrivateHost('172.16.0.1'), true);
+    assert.equal(isPrivateHost('172.15.0.1'), false);
+    assert.equal(isPrivateHost('news.google.com'), false);
+    assert.equal(isPrivateHost(''), true);
+});
+
+test('web-page htmlToText bỏ script/style, giữ nội dung, giải mã entity', () => {
+    const html = '<html><head><title>Test &amp; more</title><style>a{color:red}</style><script>var x=1</script></head>'
+        + '<body><div class="menu">Trang chủ Giới thiệu</div><p>Giá vàng SJC mua vào <b>142,7 triệu</b> đồng.</p>'
+        + '<ul><li>Độ ẩm cao &#39;nắng đẹp&#39; hôm nay.</li></ul></body></html>';
+    const text = htmlToText(html, 500);
+    assert.ok(!text.includes('color:red'));
+    assert.ok(!text.includes('var x=1'));
+    assert.ok(text.includes('142,7 triệu'));
+    assert.ok(text.includes("nắng đẹp"));
+    assert.ok(text.includes("Độ ẩm cao 'nắng đẹp' hôm nay."));
+});
+
+test('web-page htmlToText giải mã entity tiếng Việt (acute/horn/circ/breve)', () => {
+    const html = '<body><p>Gi&aacute; v&agrave;ng &ocirc;ng H&#7891;ng, th&#7871;, ng&agrave;y 28/10, &ocirc; &#7891;.</p></body>';
+    const text = htmlToText(html, 200);
+    assert.ok(text.includes('Giá vàng ông Hồng'), text);
+    assert.ok(text.includes('thế'), text);
+    assert.ok(text.includes('ô ồ'), text);
+    assert.ok(!text.includes('&a'), text);
+});
+
+// ================= NHÂN CÁCH OANH: máy trạng thái tâm trạng + DỖI =================
+const { lexiconMood, isInsult, makeDecideMood, MOOD_TIP } = require('../server/src/ai/mood');
+
+test('isInsult: chửi thẳng vào Oanh -> dỗi; chuyện thường ngày -> BÌNH THƯỜNG', () => {
+    assert.equal(isInsult('sao mà ngốc vậy, đồ vô dụng'), true);
+    assert.equal(isInsult('im đi, biết gì đâu'), true);           // 'im đi' = lệnh đuổi lịch sự tối thiểu
+    assert.equal(isInsult('sao em ngốc vậy'), true);              // tính từ + đại từ "em"
+    assert.equal(isInsult('mày câm à'), true);
+    // PHẢI KHÔNG dỗi - đây chỉ là tính năng phụ, bình thường là mặc định:
+    assert.equal(isInsult('bây giờ mấy giờ rồi'), false);
+    assert.equal(isInsult('hôm nay anh bị sếp mắng một trận'), false);   // mắng ANH, không phải Oanh
+    assert.equal(isInsult('game này dở tệ luôn'), false);                 // chê game, không chê Oanh
+    assert.equal(isInsult('điện thoại của anh bị hư rồi'), false);
+    assert.equal(isInsult('kể chuyện con hồ ly tinh cho anh nghe'), false); // 'hồ ly' trong truyện
+});
+
+test('lexicon mood các trạng thái thường', () => {
+    assert.equal(lexiconMood('hôm nay vui quá'), 'happy');
+    assert.equal(lexiconMood('anh mệt lắm'), 'sad');
+    assert.equal(lexiconMood('bây giờ mấy giờ rồi'), null);
+});
+
+test('dỗi như người thật: chửi -> hurt dai 2 lượt rồi TỰ HẾT, nựng -> tan dỗi (love)', () => {
+    const convos = new Map();
+    const decideMood = makeDecideMood(convos);
+    const ws = {};
+    assert.equal(decideMood(ws, null, 'đồ ngu, vô dụng'), 'hurt');   // bị chửi
+    assert.equal(decideMood(ws, null, 'bây giờ mấy giờ rồi'), 'hurt'); // dỗi dai lượt 1
+    assert.equal(decideMood(ws, null, 'kể anh nghe chuyện vui'), 'hurt'); // dỗi dai lượt 2 (câu cuối)
+    assert.equal(decideMood(ws, null, 'thời tiết hôm nay sao'), 'neutral');  // QUAY LẠI BÌNH THƯỜNG
+    assert.equal(decideMood(ws, null, 'hôm nay vui quá'), 'happy');           // vui là vui
+    // Tâm trạng THƯỜNG (vui/buồn) được giữ mượt qua các câu kế tiếp - chỉ DỖI mới tự hết
+    assert.equal(decideMood(ws, null, 'bài toán này khó quá'), 'happy');
+    // Tan dỗi phải THỬ LÚC ĐANG DỖI (không phải sau khi đã tự nguôi):
+    assert.equal(decideMood(ws, null, 'đồ dở, biết cái gì'), 'hurt');
+    assert.equal(decideMood(ws, null, 'thôi anh xin lỗi, nựng em nè'), 'love'); // tan dỗi ngay
+    assert.equal(convos.get(ws).pout, 0);
+    assert.equal(MOOD_TIP.hurt.includes('DỖI'), true);
+});

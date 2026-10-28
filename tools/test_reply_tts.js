@@ -82,7 +82,7 @@ function startServer() {
 async function waitServerReady() {
     for (let i = 0; i < 40; i++) {
         const joined = serverOut.join('');
-        if (/Server running on port/i.test(joined)) return true;
+        if (/Server running on/i.test(joined)) return true;
         await sleep(500);
     }
     return false;
@@ -188,8 +188,9 @@ const events = await scenarioFakeESP32(pcm);
 
     console.log(`\n=== KẾT QUẢ: ${pass} PASS / ${fail} FAIL ===`);
 
-    engineProc && engineProc.kill();
-    serverProc && serverProc.kill();
+    try { if (engineProc?.pid) spawn('taskkill', ['/PID', String(engineProc.pid), '/T', '/F']); } catch(e){}
+    try { if (serverProc?.pid) spawn('taskkill', ['/PID', String(serverProc.pid), '/T', '/F']); } catch(e){}
+    await sleep(500);
     process.exit(fail > 0 ? 1 : 0);
 }
 
