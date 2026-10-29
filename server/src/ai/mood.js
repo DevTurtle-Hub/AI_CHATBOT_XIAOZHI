@@ -62,7 +62,9 @@ function makeDecideMood(convos) {
             c.pout = 2; c.mood = 'hurt';
             return c.mood;
         }
-        if (c.pout > 0 && SWEET_RX.test(t)) {       // anh nựng -> làm hòa, dịu ngay
+        // Anh nựng/xin lỗi -> TAN DỖI ngay, kể cả khi pout đã hết hạn mà lịch sử
+        // chat còn giọng dỗi (model dễ giữ dai "Hứ..." nếu mood vẫn lạnh/neutral)
+        if (SWEET_RX.test(t)) {
             c.pout = 0; c.mood = 'love';
             return c.mood;
         }

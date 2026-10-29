@@ -223,5 +223,12 @@ test('dỗi như người thật: chửi -> hurt dai 2 lượt rồi TỰ HẾT,
     assert.equal(decideMood(ws, null, 'đồ dở, biết cái gì'), 'hurt');
     assert.equal(decideMood(ws, null, 'thôi anh xin lỗi, nựng em nè'), 'love'); // tan dỗi ngay
     assert.equal(convos.get(ws).pout, 0);
+    // Xin lỗi SAU khi dỗi đã tự hết hạn cũng phải đưa về love (e26 fail: model
+    // giữ "Hứ" dai vì mood kẹt neutral/lạnh trong khi lịch sử chat còn giọng dỗi)
+    assert.equal(decideMood(ws, null, 'đồ dở, biết cái gì'), 'hurt');
+    assert.equal(decideMood(ws, null, 'bây giờ mấy giờ rồi'), 'hurt');
+    assert.equal(decideMood(ws, null, 'kể chuyện vui đi'), 'hurt');   // pout về 0, mood neutral
+    assert.equal(decideMood(ws, null, 'hôm nay thế nào'), 'neutral');
+    assert.equal(decideMood(ws, null, 'anh xin lỗi nè, đừng giận nữa'), 'love'); // melt cả khi pout=0
     assert.equal(MOOD_TIP.hurt.includes('DỖI'), true);
 });
